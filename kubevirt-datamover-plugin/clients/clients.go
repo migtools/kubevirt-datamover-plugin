@@ -15,20 +15,12 @@
 package clients
 
 import (
-	"k8s.io/client-go/discovery"
-	appsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 )
 
 var coreClient *corev1.CoreV1Client
 var coreClientError error
-
-var appsClient *appsv1.AppsV1Client
-var appsClientError error
-
-var discoveryClient *discovery.DiscoveryClient
-var discoveryClientError error
 
 var inClusterConfig *rest.Config
 
@@ -80,73 +72,6 @@ func newCoreClient() (*corev1.CoreV1Client, error) {
 	return client, nil
 }
 
-// AppsClient returns a kubernetes AppsV1Client (singleton)
-func AppsClient() (*appsv1.AppsV1Client, error) {
-	if appsClient == nil && appsClientError == nil {
-		appsClient, appsClientError = newAppsClient()
-	}
-	return appsClient, appsClientError
-}
-
-func newAppsClient() (*appsv1.AppsV1Client, error) {
-	config, err := GetInClusterConfig()
-	if err != nil {
-		return nil, err
-	}
-	client, err := appsv1.NewForConfig(config)
-	if err != nil {
-		return nil, err
-	}
-	return client, nil
-}
-
-// DiscoveryClient returns a client-go DiscoveryClient (singleton)
-func DiscoveryClient() (*discovery.DiscoveryClient, error) {
-	if discoveryClient == nil && discoveryClientError == nil {
-		discoveryClient, discoveryClientError = newDiscoveryClient()
-	}
-	return discoveryClient, discoveryClientError
-}
-
-func newDiscoveryClient() (*discovery.DiscoveryClient, error) {
-	config, err := GetInClusterConfig()
-	if err != nil {
-		return nil, err
-	}
-	client, err := discovery.NewDiscoveryClientForConfig(config)
-	if err != nil {
-		return nil, err
-	}
-	return client, nil
-}
-
-// Add more client factories here as needed
-// Example for KubeVirt client:
-//
-// var kubevirtClient *kubevirtclient.KubevirtV1Client
-// var kubevirtClientError error
-//
-// func KubevirtClient() (*kubevirtclient.KubevirtV1Client, error) {
-//     if kubevirtClient == nil && kubevirtClientError == nil {
-//         kubevirtClient, kubevirtClientError = newKubevirtClient()
-//     }
-//     return kubevirtClient, kubevirtClientError
-// }
-//
-// func newKubevirtClient() (*kubevirtclient.KubevirtV1Client, error) {
-//     config, err := GetInClusterConfig()
-//     if err != nil {
-//         return nil, err
-//     }
-//     client, err := kubevirtclient.NewForConfig(config)
-//     if err != nil {
-//         return nil, err
-//     }
-//     return client, nil
-// }
-
 func init() {
 	coreClient, coreClientError = nil, nil
-	appsClient, appsClientError = nil, nil
-	discoveryClient, discoveryClientError = nil, nil
 }
