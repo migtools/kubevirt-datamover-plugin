@@ -30,6 +30,10 @@ make container
 make test
 ```
 
+## Container Image
+
+The container image is published to `quay.io/konveyor/kubevirt-datamover-plugin` via a [periodic image mirroring job](https://prow.ci.openshift.org/?job=periodic-image-mirroring-konveyor) in OpenShift CI (Prow).
+
 ## Questions?
 
 For questions or discussions, please open an issue or reach out via the OADP community channels.
