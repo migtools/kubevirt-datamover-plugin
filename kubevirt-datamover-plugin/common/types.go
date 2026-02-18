@@ -86,12 +86,14 @@ const (
 type VolumeSnapshotAction string
 
 const (
-	// VolumeSnapshotActionSnapshot triggers kubevirt datamover backup
-	// This is the action we check for to determine if a VM should use kubevirt datamover
-	VolumeSnapshotActionSnapshot VolumeSnapshotAction = "snapshot"
-
-	// VolumeSnapshotActionSkip skip the volume
+	// VolumeSnapshotActionSkip triggers kubevirt datamover backup for now.
+	// We use "skip" because it prevents Velero's default CSI snapshot handling,
+	// allowing the kubevirt datamover to handle the backup instead.
+	// TODO(https://github.com/migtools/kubevirt-datamover-plugin/issues/4): Change to "custom" once upstream lands.
 	VolumeSnapshotActionSkip VolumeSnapshotAction = "skip"
+
+	// VolumeSnapshotActionSnapshot indicates CSI snapshot - conflicts with kubevirt datamover
+	VolumeSnapshotActionSnapshot VolumeSnapshotAction = "snapshot"
 
 	// VolumeSnapshotActionOther some other action (fs-backup, etc.)
 	VolumeSnapshotActionOther VolumeSnapshotAction = "other"

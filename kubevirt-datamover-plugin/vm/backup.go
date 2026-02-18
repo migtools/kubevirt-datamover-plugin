@@ -112,8 +112,8 @@ func (p *BackupPlugin) Execute(
 	operationID := generateOperationID(backup.Name, vm.Namespace, vm.Name)
 	p.Log.Infof("[vm-backup] Generated operation ID: %s", operationID)
 
-	// Get the first PVC with snapshot volume policy for SourcePVC
-	sourcePVC, err := p.getFirstSnapshotPVC(vm, backup)
+	// Get the first PVC with skip volume policy for SourcePVC (kubevirt datamover trigger)
+	sourcePVC, err := p.getFirstKubevirtPVC(vm, backup)
 	if err != nil {
 		return nil, nil, "", nil, fmt.Errorf("failed to get source PVC: %w", err)
 	}
@@ -270,17 +270,23 @@ func (p *BackupPlugin) checkPreconditions(vm *kvcore.VirtualMachine, backup *vel
 		return false, err.Error(), nil
 	}
 
-	// Check 4: Volume policy check - at least one PVC must have "snapshot" action
+	// Check 4: Volume policy check
+	// - At least one PVC must have "skip" action (triggers kubevirt datamover)
+	// - No PVC can have "snapshot" action (would conflict with kubevirt datamover)
 	// TODO(https://github.com/migtools/kubevirt-datamover-plugin/issues/4): Once upstream
 	// Velero changes are merged, update this to check for "custom" action type and inspect
 	// the action parameters map to verify it's for kubevirt.
-	hasSnapshotPolicy, err := p.checkVolumePolicies(vm, backup)
+	hasKubevirtPolicy, hasConflictingPolicy, err := p.checkVolumePolicies(vm, backup)
 	if err != nil {
 		return false, "", fmt.Errorf("failed to check volume policies: %w", err)
 	}
 
-	if !hasSnapshotPolicy {
-		return false, "no PVCs with snapshot volume policy found", nil
+	if hasConflictingPolicy {
+		return false, "VirtualMachine has PVCs with snapshot volume policy which conflicts with kubevirt datamover", nil
+	}
+
+	if !hasKubevirtPolicy {
+		return false, "no PVCs with skip volume policy found for kubevirt datamover", nil
 	}
 
 	return true, "", nil
@@ -288,34 +294,41 @@ func (p *BackupPlugin) checkPreconditions(vm *kvcore.VirtualMachine, backup *vel
 
 // checkVolumePolicies examines the volume policies for all PVCs associated with the VM.
 // Returns:
-//   - hasSnapshotPolicy: true if at least one PVC has "snapshot" action
+//   - hasKubevirtPolicy: true if at least one PVC has "skip" action (kubevirt datamover trigger)
+//   - hasConflictingPolicy: true if any PVC has "snapshot" action (conflicts with kubevirt datamover)
 //   - error: if there was an error checking policies
 //
 // TODO(https://github.com/migtools/kubevirt-datamover-plugin/issues/4): Once upstream
-// Velero changes are merged, update this to check for "custom" action type.
-func (p *BackupPlugin) checkVolumePolicies(vm *kvcore.VirtualMachine, backup *velerov1.Backup) (bool, error) {
-	hasSnapshotPolicy := false
+// Velero changes are merged, update this to check for "custom" action type instead of "skip".
+func (p *BackupPlugin) checkVolumePolicies(vm *kvcore.VirtualMachine, backup *velerov1.Backup) (bool, bool, error) {
+	hasKubevirtPolicy := false
+	hasConflictingPolicy := false
 
 	// Get all PVCs associated with this VM using controller common function
 	pvcNames := controllercommon.GetVolumesForVm(vm)
 	if len(pvcNames) == 0 {
 		p.Log.Infof("[vm-backup] VirtualMachine %s/%s has no PVCs", vm.Namespace, vm.Name)
-		return false, nil
+		return false, false, nil
 	}
 
 	for _, pvcName := range pvcNames {
 		action, err := p.getVolumePolicyAction(vm.Namespace, pvcName, backup)
 		if err != nil {
-			return false, fmt.Errorf("failed to get volume policy for PVC %s: %w", pvcName, err)
+			return false, false, fmt.Errorf("failed to get volume policy for PVC %s: %w", pvcName, err)
 		}
 
-		if action == common.VolumeSnapshotActionSnapshot {
-			hasSnapshotPolicy = true
-			break
+		switch action {
+		case common.VolumeSnapshotActionSkip:
+			// "skip" triggers kubevirt datamover (will be "custom" after upstream changes)
+			hasKubevirtPolicy = true
+		case common.VolumeSnapshotActionSnapshot:
+			// "snapshot" conflicts - would cause both CSI snapshot and kubevirt datamover
+			hasConflictingPolicy = true
+			p.Log.Warnf("[vm-backup] PVC %s/%s has snapshot policy which conflicts with kubevirt datamover", vm.Namespace, pvcName)
 		}
 	}
 
-	return hasSnapshotPolicy, nil
+	return hasKubevirtPolicy, hasConflictingPolicy, nil
 }
 
 // getVolumePolicyAction determines the volume policy action for a specific PVC.
@@ -342,10 +355,10 @@ func (p *BackupPlugin) getVolumePolicyAction(namespace, pvcName string, backup *
 	}
 
 	// Check backup resource policies if available
-	// For now, default to snapshot if the backup has SnapshotMoveData enabled
-	// and no explicit policy is set
+	// For now, default to skip if the backup has SnapshotMoveData enabled
+	// and no explicit policy is set (skip triggers kubevirt datamover)
 	if backup.Spec.SnapshotMoveData != nil && *backup.Spec.SnapshotMoveData {
-		return common.VolumeSnapshotActionSnapshot, nil
+		return common.VolumeSnapshotActionSkip, nil
 	}
 
 	return common.VolumeSnapshotActionOther, nil
@@ -356,10 +369,12 @@ func (p *BackupPlugin) getVolumePolicyAction(namespace, pvcName string, backup *
 // Velero changes are merged, add handling for "custom" action type.
 func (p *BackupPlugin) parseVolumePolicyAction(action string) common.VolumeSnapshotAction {
 	switch action {
-	case common.VolumePolicyActionSnapshot:
-		return common.VolumeSnapshotActionSnapshot
 	case common.VolumePolicyActionSkip:
+		// "skip" triggers kubevirt datamover (will be "custom" after upstream changes)
 		return common.VolumeSnapshotActionSkip
+	case common.VolumePolicyActionSnapshot:
+		// "snapshot" conflicts with kubevirt datamover
+		return common.VolumeSnapshotActionSnapshot
 	case common.VolumePolicyActionFSBackup:
 		return common.VolumeSnapshotActionOther
 	default:
@@ -367,9 +382,10 @@ func (p *BackupPlugin) parseVolumePolicyAction(action string) common.VolumeSnaps
 	}
 }
 
-// getFirstSnapshotPVC returns the first PVC with snapshot volume policy.
+// getFirstKubevirtPVC returns the first PVC with skip volume policy (kubevirt datamover trigger).
 // This PVC will be used as the SourcePVC in the DataUpload spec.
-func (p *BackupPlugin) getFirstSnapshotPVC(vm *kvcore.VirtualMachine, backup *velerov1.Backup) (*corev1.PersistentVolumeClaim, error) {
+// TODO(https://github.com/migtools/kubevirt-datamover-plugin/issues/4): Change to check for "custom" once upstream lands.
+func (p *BackupPlugin) getFirstKubevirtPVC(vm *kvcore.VirtualMachine, backup *velerov1.Backup) (*corev1.PersistentVolumeClaim, error) {
 	pvcNames := controllercommon.GetVolumesForVm(vm)
 	if len(pvcNames) == 0 {
 		return nil, fmt.Errorf("no PVCs found for VirtualMachine %s/%s", vm.Namespace, vm.Name)
@@ -389,15 +405,15 @@ func (p *BackupPlugin) getFirstSnapshotPVC(vm *kvcore.VirtualMachine, backup *ve
 
 		action, err := p.getVolumePolicyAction(vm.Namespace, pvcName, backup)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("failed to get volume policy for PVC %s: %w", pvcName, err)
 		}
 
-		if action == common.VolumeSnapshotActionSnapshot {
+		if action == common.VolumeSnapshotActionSkip {
 			return pvc, nil
 		}
 	}
 
-	return nil, fmt.Errorf("no PVC with snapshot volume policy found for VirtualMachine %s/%s", vm.Namespace, vm.Name)
+	return nil, fmt.Errorf("no PVC with skip volume policy found for VirtualMachine %s/%s", vm.Namespace, vm.Name)
 }
 
 // createDataUpload creates a DataUpload CR for the kubevirt datamover.
