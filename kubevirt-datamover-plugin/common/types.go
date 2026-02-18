@@ -12,49 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package common contains shared types and constants for the kubevirt datamover plugin.
+// Note: Volume policy checking is now done via velero's volumehelper package which
+// reads policies from the resource policy configmap. The constants previously defined
+// here for volume policy actions have been removed as they are no longer needed.
 package common
-
-// Volume policy action constants - plugin-specific
-// Note: These match velero's internal/resourcepolicies constants but cannot be imported
-// because they are in an internal package. Keep in sync with velero's VolumeActionType values.
-// TODO(https://github.com/migtools/kubevirt-datamover-plugin/issues/4): Once upstream
-// Velero changes are merged, add "custom" action type constant.
-const (
-	// VolumePolicyActionSkip indicates the volume should be skipped
-	// Matches velero internal/resourcepolicies.Skip
-	VolumePolicyActionSkip = "skip"
-
-	// VolumePolicyActionSnapshot indicates CSI snapshot should be used
-	// This is currently used to trigger kubevirt datamover backup
-	// Matches velero internal/resourcepolicies.Snapshot
-	VolumePolicyActionSnapshot = "snapshot"
-
-	// VolumePolicyActionFSBackup indicates filesystem backup should be used
-	// Matches velero internal/resourcepolicies.FSBackup
-	VolumePolicyActionFSBackup = "fs-backup"
-)
-
-// Annotation keys
-const (
-	// AnnVolumePolicy is the annotation for volume policy on PVC
-	AnnVolumePolicy = "velero.io/volume-policy"
-)
-
-// VolumeSnapshotAction represents the action to take for a volume
-// TODO(https://github.com/migtools/kubevirt-datamover-plugin/issues/4): Once upstream
-// Velero changes are merged, add VolumeSnapshotActionCustom for the new "custom" action type.
-type VolumeSnapshotAction string
-
-const (
-	// VolumeSnapshotActionSkip triggers kubevirt datamover backup for now.
-	// We use "skip" because it prevents Velero's default CSI snapshot handling,
-	// allowing the kubevirt datamover to handle the backup instead.
-	// TODO(https://github.com/migtools/kubevirt-datamover-plugin/issues/4): Change to "custom" once upstream lands.
-	VolumeSnapshotActionSkip VolumeSnapshotAction = "skip"
-
-	// VolumeSnapshotActionSnapshot indicates CSI snapshot - conflicts with kubevirt datamover
-	VolumeSnapshotActionSnapshot VolumeSnapshotAction = "snapshot"
-
-	// VolumeSnapshotActionOther some other action (fs-backup, etc.)
-	VolumeSnapshotActionOther VolumeSnapshotAction = "other"
-)

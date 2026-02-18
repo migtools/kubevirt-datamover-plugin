@@ -17,10 +17,14 @@ package clients
 import (
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var coreClient *corev1.CoreV1Client
 var coreClientError error
+
+var crClient crclient.Client
+var crClientError error
 
 var inClusterConfig *rest.Config
 
@@ -72,6 +76,27 @@ func newCoreClient() (*corev1.CoreV1Client, error) {
 	return client, nil
 }
 
+// CRClient returns a controller-runtime client (singleton)
+func CRClient() (crclient.Client, error) {
+	if crClient == nil && crClientError == nil {
+		crClient, crClientError = newCRClient()
+	}
+	return crClient, crClientError
+}
+
+func newCRClient() (crclient.Client, error) {
+	config, err := GetInClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+	client, err := crclient.New(config, crclient.Options{})
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
 func init() {
 	coreClient, coreClientError = nil, nil
+	crClient, crClientError = nil, nil
 }

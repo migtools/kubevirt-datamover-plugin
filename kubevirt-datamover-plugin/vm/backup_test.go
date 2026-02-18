@@ -32,7 +32,6 @@ import (
 	kvcore "kubevirt.io/api/core/v1"
 
 	controllercommon "github.com/migtools/kubevirt-datamover-controller/pkg/common"
-	"github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/common"
 )
 
 const (
@@ -410,49 +409,6 @@ func TestControllerGetVolumesForVm(t *testing.T) {
 	}
 }
 
-func TestBackupPlugin_parseVolumePolicyAction(t *testing.T) {
-	plugin := NewBackupPlugin(newTestLogger())
-
-	testCases := []struct {
-		name     string
-		action   string
-		expected common.VolumeSnapshotAction
-	}{
-		{
-			name:     "snapshot action",
-			action:   common.VolumePolicyActionSnapshot,
-			expected: common.VolumeSnapshotActionSnapshot,
-		},
-		{
-			name:     "skip action",
-			action:   common.VolumePolicyActionSkip,
-			expected: common.VolumeSnapshotActionSkip,
-		},
-		{
-			name:     "fs-backup action",
-			action:   common.VolumePolicyActionFSBackup,
-			expected: common.VolumeSnapshotActionOther,
-		},
-		{
-			name:     "unknown action",
-			action:   "unknown",
-			expected: common.VolumeSnapshotActionOther,
-		},
-		{
-			name:     "empty action",
-			action:   "",
-			expected: common.VolumeSnapshotActionOther,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			result := plugin.parseVolumePolicyAction(tc.action)
-			assert.Equal(t, tc.expected, result)
-		})
-	}
-}
-
 func TestBackupPlugin_checkPreconditions(t *testing.T) {
 	plugin := NewBackupPlugin(newTestLogger())
 
@@ -570,11 +526,6 @@ func TestBackupPlugin_Progress(t *testing.T) {
 	// Skip this test if not running with proper integration setup
 	// The Progress function requires kubernetes client setup
 	t.Skip("Skipping Progress test - requires integration test setup with kubernetes client")
-}
-
-// TestCommonConstants verifies plugin-specific constants.
-func TestCommonConstants(t *testing.T) {
-	assert.Equal(t, "velero.io/volume-policy", common.AnnVolumePolicy)
 }
 
 // Helper functions
