@@ -572,26 +572,9 @@ func TestBackupPlugin_Progress(t *testing.T) {
 	t.Skip("Skipping Progress test - requires integration test setup with kubernetes client")
 }
 
-// TestCommonConstants verifies that the common package re-exports the controller constants correctly.
+// TestCommonConstants verifies plugin-specific constants.
 func TestCommonConstants(t *testing.T) {
-	// Verify that the re-exported constants match the controller's constants
-	assert.Equal(t, controllercommon.AnnotationVMName, common.AnnotationVMName)
-	assert.Equal(t, controllercommon.AnnotationVMNamespace, common.AnnotationVMNamespace)
-	assert.Equal(t, controllercommon.AnnotationOperationID, common.AnnotationOperationID)
-	assert.Equal(t, controllercommon.DataMoverKubeVirt, common.DataMoverKubeVirt)
-	assert.Equal(t, controllercommon.SnapshotTypeCSI, common.SnapshotTypeCSI)
-
-	// Verify the annotation key values
-	assert.Equal(t, "kubevirt-datamover.io/vm-name", common.AnnotationVMName)
-	assert.Equal(t, "kubevirt-datamover.io/vm-namespace", common.AnnotationVMNamespace)
-	assert.Equal(t, "kubevirt-datamover.io/operation-id", common.AnnotationOperationID)
-	assert.Equal(t, "kubevirt", common.DataMoverKubeVirt)
-	assert.Equal(t, "CSI", common.SnapshotTypeCSI)
-
-	// Verify plugin-specific constants
-	assert.Equal(t, "velero.io/data-upload-name", common.AnnDataUploadName)
 	assert.Equal(t, "velero.io/volume-policy", common.AnnVolumePolicy)
-	assert.Equal(t, "velero.io/backup-name", common.LabelBackupName)
 }
 
 // Helper functions

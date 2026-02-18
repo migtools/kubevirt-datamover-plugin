@@ -131,8 +131,8 @@ func (p *BackupPlugin) Execute(
 	if vm.Annotations == nil {
 		vm.Annotations = make(map[string]string)
 	}
-	vm.Annotations[common.AnnDataUploadName] = dataUpload.Name
-	vm.Annotations[common.AnnotationOperationID] = operationID
+	vm.Annotations[velerov1.DataUploadNameAnnotation] = dataUpload.Name
+	vm.Annotations[controllercommon.AnnotationOperationID] = operationID
 
 	// Convert back to unstructured
 	vmMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(vm)
@@ -436,13 +436,13 @@ func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *veler
 			Name:      dataUploadName,
 			Namespace: backup.Namespace,
 			Labels: map[string]string{
-				common.LabelBackupName: backup.Name,
+				velerov1.BackupNameLabel: backup.Name,
 			},
 			Annotations: map[string]string{
 				// Use controller common constants for annotations that the controller reads
-				common.AnnotationVMName:      vm.Name,
-				common.AnnotationVMNamespace: vm.Namespace,
-				common.AnnotationOperationID: operationID,
+				controllercommon.AnnotationVMName:      vm.Name,
+				controllercommon.AnnotationVMNamespace: vm.Namespace,
+				controllercommon.AnnotationOperationID: operationID,
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
@@ -459,8 +459,8 @@ func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *veler
 			// SnapshotType, this should be changed to use a kubevirt-specific value.
 			// The DataMover field ("kubevirt") indicates that the kubevirt-datamover-controller
 			// should handle this DataUpload rather than Velero's built-in datamover.
-			SnapshotType:          velerov2alpha1.SnapshotType(common.SnapshotTypeCSI),
-			DataMover:             common.DataMoverKubeVirt,
+			SnapshotType:          velerov2alpha1.SnapshotType(controllercommon.SnapshotTypeCSI),
+			DataMover:             controllercommon.DataMoverKubeVirt,
 			BackupStorageLocation: backup.Spec.StorageLocation,
 			SourceNamespace:       vm.Namespace,
 			OperationTimeout:      operationTimeout,
@@ -549,7 +549,7 @@ func (p *BackupPlugin) getDataUploadByOperationID(operationID string, backup *ve
 	list, err := dynamicClient.Resource(gvr).Namespace(backup.Namespace).List(
 		context.Background(),
 		metav1.ListOptions{
-			LabelSelector: fmt.Sprintf("%s=%s", common.LabelBackupName, backup.Name),
+			LabelSelector: fmt.Sprintf("%s=%s", velerov1.BackupNameLabel, backup.Name),
 		},
 	)
 	if err != nil {
@@ -558,7 +558,7 @@ func (p *BackupPlugin) getDataUploadByOperationID(operationID string, backup *ve
 
 	for _, item := range list.Items {
 		annotations := item.GetAnnotations()
-		if annotations != nil && annotations[common.AnnotationOperationID] == operationID {
+		if annotations != nil && annotations[controllercommon.AnnotationOperationID] == operationID {
 			du := &velerov2alpha1.DataUpload{}
 			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(item.Object, du); err != nil {
 				return nil, fmt.Errorf("failed to convert unstructured to DataUpload: %w", err)
