@@ -15,6 +15,8 @@
 package clients
 
 import (
+	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -89,7 +91,14 @@ func newCRClient() (crclient.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	client, err := crclient.New(config, crclient.Options{})
+
+	// Create scheme with core types registered for volumehelper
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+
+	client, err := crclient.New(config, crclient.Options{Scheme: scheme})
 	if err != nil {
 		return nil, err
 	}

@@ -636,13 +636,34 @@ func generateOperationID(backupName, namespace, vmName string) string {
 }
 
 // generateDataUploadName creates a name for the DataUpload CR.
+// The name format is: du-<backupName>-<vmName>-<uuid8>
+// If the total length exceeds 253 characters (Kubernetes limit),
+// the backupName and vmName are truncated while preserving the UUID suffix.
 func generateDataUploadName(backupName, vmName string) string {
-	// Ensure name doesn't exceed Kubernetes limits (253 characters)
-	name := fmt.Sprintf("du-%s-%s-%s", backupName, vmName, uuid.New().String()[:8])
-	if len(name) > 253 {
-		name = name[:253]
+	uuidSuffix := uuid.New().String()[:8]
+	// Reserve space for: "du-" (3) + "-" (1) + "-" (1) + uuid (8) = 13 chars
+	const fixedLen = 13
+	maxBodyLen := 253 - fixedLen // 240 chars available for backupName + vmName
+
+	// Truncate names if needed, preserving UUID for uniqueness
+	totalBodyLen := len(backupName) + len(vmName)
+	if totalBodyLen > maxBodyLen {
+		// Truncate proportionally, giving slight preference to backupName
+		halfMax := maxBodyLen / 2
+		if len(backupName) > halfMax && len(vmName) > halfMax {
+			// Both are long, truncate both
+			backupName = backupName[:halfMax]
+			vmName = vmName[:maxBodyLen-halfMax]
+		} else if len(backupName) > halfMax {
+			// Only backupName is long
+			backupName = backupName[:maxBodyLen-len(vmName)]
+		} else {
+			// Only vmName is long
+			vmName = vmName[:maxBodyLen-len(backupName)]
+		}
 	}
-	return name
+
+	return fmt.Sprintf("du-%s-%s-%s", backupName, vmName, uuidSuffix)
 }
 
 // getDynamicClient returns a dynamic client for working with unstructured resources.
