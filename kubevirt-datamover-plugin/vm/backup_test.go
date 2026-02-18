@@ -419,19 +419,14 @@ func TestBackupPlugin_parseVolumePolicyAction(t *testing.T) {
 		expected common.VolumeSnapshotAction
 	}{
 		{
-			name:     "kubevirt action",
-			action:   common.VolumePolicyActionKubevirt,
-			expected: common.VolumeSnapshotActionKubevirt,
+			name:     "snapshot action",
+			action:   common.VolumePolicyActionSnapshot,
+			expected: common.VolumeSnapshotActionSnapshot,
 		},
 		{
 			name:     "skip action",
 			action:   common.VolumePolicyActionSkip,
 			expected: common.VolumeSnapshotActionSkip,
-		},
-		{
-			name:     "snapshot action",
-			action:   common.VolumePolicyActionSnapshot,
-			expected: common.VolumeSnapshotActionOther,
 		},
 		{
 			name:     "fs-backup action",

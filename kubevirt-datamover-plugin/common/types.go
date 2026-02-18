@@ -16,6 +16,7 @@ package common
 
 import (
 	controllercommon "github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 )
 
 // Re-export shared constants from the controller package for convenience.
@@ -43,45 +44,55 @@ const (
 )
 
 // Volume policy action constants - plugin-specific
+// Note: These match velero's internal/resourcepolicies constants but cannot be imported
+// because they are in an internal package. Keep in sync with velero's VolumeActionType values.
+// TODO(https://github.com/migtools/kubevirt-datamover-plugin/issues/4): Once upstream
+// Velero changes are merged, add "custom" action type constant.
 const (
-	// VolumePolicyActionKubevirt is the volume policy action that triggers kubevirt datamover
-	VolumePolicyActionKubevirt = "kubevirt"
-
 	// VolumePolicyActionSkip indicates the volume should be skipped
+	// Matches velero internal/resourcepolicies.Skip
 	VolumePolicyActionSkip = "skip"
 
 	// VolumePolicyActionSnapshot indicates CSI snapshot should be used
+	// This is currently used to trigger kubevirt datamover backup
+	// Matches velero internal/resourcepolicies.Snapshot
 	VolumePolicyActionSnapshot = "snapshot"
 
 	// VolumePolicyActionFSBackup indicates filesystem backup should be used
+	// Matches velero internal/resourcepolicies.FSBackup
 	VolumePolicyActionFSBackup = "fs-backup"
 )
 
-// Annotation keys specific to the plugin (not shared with controller)
+// Annotation keys - use velero's exported constants where available
 const (
 	// AnnDataUploadName is the annotation key for the DataUpload name on VirtualMachine
-	AnnDataUploadName = "velero.io/data-upload-name"
+	// Re-exported from velero for convenience
+	AnnDataUploadName = velerov1.DataUploadNameAnnotation
 
 	// AnnVolumePolicy is the annotation for volume policy on PVC
 	AnnVolumePolicy = "velero.io/volume-policy"
 )
 
-// Label keys specific to the plugin
+// Label keys - use velero's exported constants where available
 const (
 	// LabelBackupName is the label for the backup name
-	LabelBackupName = "velero.io/backup-name"
+	// Re-exported from velero for convenience
+	LabelBackupName = velerov1.BackupNameLabel
 )
 
 // VolumeSnapshotAction represents the action to take for a volume
+// TODO(https://github.com/migtools/kubevirt-datamover-plugin/issues/4): Once upstream
+// Velero changes are merged, add VolumeSnapshotActionCustom for the new "custom" action type.
 type VolumeSnapshotAction string
 
 const (
-	// VolumeSnapshotActionKubevirt use kubevirt datamover
-	VolumeSnapshotActionKubevirt VolumeSnapshotAction = "kubevirt"
+	// VolumeSnapshotActionSnapshot triggers kubevirt datamover backup
+	// This is the action we check for to determine if a VM should use kubevirt datamover
+	VolumeSnapshotActionSnapshot VolumeSnapshotAction = "snapshot"
 
 	// VolumeSnapshotActionSkip skip the volume
 	VolumeSnapshotActionSkip VolumeSnapshotAction = "skip"
 
-	// VolumeSnapshotActionOther some other action (snapshot, fs-backup, etc.)
+	// VolumeSnapshotActionOther some other action (fs-backup, etc.)
 	VolumeSnapshotActionOther VolumeSnapshotAction = "other"
 )
