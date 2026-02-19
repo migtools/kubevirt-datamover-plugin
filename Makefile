@@ -16,7 +16,7 @@ BINS = $(wildcard kubevirt-datamover-*)
 
 REPO ?= github.com/migtools/kubevirt-datamover-plugin
 
-BUILD_IMAGE ?= golang:1.22
+BUILD_IMAGE ?= golang:1.25
 
 IMAGE ?= quay.io/konveyor/kubevirt-datamover-plugin
 
@@ -84,9 +84,29 @@ container-push:
 test:
 	go test ./kubevirt-datamover-plugin/...
 
-ci: all test
+# golangci-lint binary location
+GOLANGCI_LINT ?= $(shell which golangci-lint)
+
+# Install golangci-lint if not present
+.PHONY: golangci-lint
+golangci-lint:
+ifeq ($(GOLANGCI_LINT),)
+	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+	$(eval GOLANGCI_LINT = $(shell go env GOPATH)/bin/golangci-lint)
+endif
+
+lint: golangci-lint
+	$(GOLANGCI_LINT) run ./...
+
+fmt:
+	go fmt ./...
+
+vet:
+	go vet ./...
+
+ci: all test lint
 
 clean:
 	rm -rf .go _output
 
-.PHONY: all build build-local container container-push test ci clean
+.PHONY: all build build-local container container-push test lint fmt vet ci clean

@@ -15,25 +15,27 @@
 package main
 
 import (
+	"github.com/sirupsen/logrus"
 	veleroplugin "github.com/vmware-tanzu/velero/pkg/plugin/framework"
+
+	"github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/vm"
 )
 
 func main() {
 	veleroplugin.NewServer().
-		// Register your backup and restore plugins here
-		// Example:
-		// RegisterBackupItemAction("kubevirt.io/01-vm-backup-plugin", newVMBackupPlugin).
-		// RegisterRestoreItemAction("kubevirt.io/01-vm-restore-plugin", newVMRestorePlugin).
+		// VirtualMachine BackupItemAction for kubevirt datamover
+		// This plugin handles VirtualMachine resources by checking preconditions
+		// (CBT enabled, VM running, kubevirt volume policy) and creating DataUpload CRs
+		// for incremental backup via the kubevirt datamover controller.
+		RegisterBackupItemActionV2("kubevirt.io/01-vm-datamover-backup-plugin", newVMBackupPlugin).
 		Serve()
 }
 
-// Add plugin constructor functions here as you implement them
-// Example:
-//
-// func newVMBackupPlugin(logger logrus.FieldLogger) (interface{}, error) {
-//     return &vm.BackupPlugin{Log: logger}, nil
-// }
-//
-// func newVMRestorePlugin(logger logrus.FieldLogger) (interface{}, error) {
-//     return &vm.RestorePlugin{Log: logger}, nil
-// }
+// newVMBackupPlugin creates a new VirtualMachine BackupItemAction plugin.
+// This plugin is responsible for:
+// - Checking if VirtualMachine is eligible for kubevirt datamover backup
+// - Creating DataUpload CRs with SnapshotType and DataMover set to "kubevirt"
+// - Tracking async operation progress via the DataUpload status
+func newVMBackupPlugin(logger logrus.FieldLogger) (interface{}, error) {
+	return vm.NewBackupPlugin(logger), nil
+}
