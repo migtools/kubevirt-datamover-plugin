@@ -459,7 +459,7 @@ func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *veler
 			Name:      dataUploadName,
 			Namespace: backup.Namespace,
 			Labels: map[string]string{
-				velerov1.BackupNameLabel: backup.Name,
+				velerov1.BackupNameLabel: controllercommon.SafeLabelValue(backup.Name),
 			},
 			Annotations: map[string]string{
 				// Use controller common constants for annotations that the controller reads
@@ -572,7 +572,7 @@ func (p *BackupPlugin) getDataUploadByOperationID(operationID string, backup *ve
 	list, err := dynamicClient.Resource(gvr).Namespace(backup.Namespace).List(
 		context.Background(),
 		metav1.ListOptions{
-			LabelSelector: fmt.Sprintf("%s=%s", velerov1.BackupNameLabel, backup.Name),
+			LabelSelector: fmt.Sprintf("%s=%s", velerov1.BackupNameLabel, controllercommon.SafeLabelValue(backup.Name)),
 		},
 	)
 	if err != nil {

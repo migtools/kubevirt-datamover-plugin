@@ -4,7 +4,7 @@ go 1.25.3
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260128163458-5a6766074388
+	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260303170220-6393b88590ad
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.11.1
 	github.com/vmware-tanzu/velero v1.15.0
@@ -12,6 +12,7 @@ require (
 	k8s.io/apimachinery v0.35.0
 	k8s.io/client-go v0.35.0
 	kubevirt.io/api v1.8.0-alpha.0
+	sigs.k8s.io/controller-runtime v0.23.0
 )
 
 require (
@@ -79,7 +80,6 @@ require (
 	k8s.io/utils v0.0.0-20251002143259-bc988d571ff4 // indirect
 	kubevirt.io/containerized-data-importer-api v1.63.1 // indirect
 	kubevirt.io/controller-lifecycle-operator-sdk/api v0.0.0-20220329064328-f3cc58c6ed90 // indirect
-	sigs.k8s.io/controller-runtime v0.23.0 // indirect
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.0 // indirect
