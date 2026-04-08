@@ -34,6 +34,7 @@ import (
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
+	"github.com/vmware-tanzu/velero/pkg/label"
 	"github.com/vmware-tanzu/velero/pkg/plugin/utils/volumehelper"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
 
@@ -135,6 +136,7 @@ func (p *BackupPlugin) Execute(
 	}
 	vm.Annotations[velerov1.DataUploadNameAnnotation] = dataUpload.Name
 	vm.Annotations[controllercommon.AnnotationOperationID] = operationID
+	vm.Annotations[velerov1.PVCNamespaceNameLabel] = label.GetValidName(fmt.Sprintf("%s.%s", sourcePVC.Namespace, sourcePVC.Name))
 
 	// Convert back to unstructured
 	vmMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(vm)
