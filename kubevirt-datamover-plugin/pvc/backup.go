@@ -15,7 +15,10 @@
 package pvc
 
 import (
+	"fmt"
+
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -50,6 +53,20 @@ func (p *BackupPlugin) Execute(
 	item runtime.Unstructured,
 	backup *velerov1.Backup,
 ) (runtime.Unstructured, []velero.ResourceIdentifier, string, []velero.ResourceIdentifier, error) {
+	p.Log.Info("[pvc-backup] Executing PersistentVolumeClaim backup plugin for kubevirt datamover")
+
+	if backup == nil {
+		return nil, nil, "", nil, fmt.Errorf("backup object is nil")
+	}
+
+	// Convert unstructured to PersistentVolumeClaim
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(item.UnstructuredContent(), pvc); err != nil {
+		return nil, nil, "", nil, fmt.Errorf("failed to convert item to PersistentVolumeClaim: %w", err)
+	}
+
+	p.Log.Infof("[pvc-backup] Processing PersistentVolumeClaim %s/%s", pvc.Namespace, pvc.Name)
+
 	return item, nil, "", nil, nil
 }
 
