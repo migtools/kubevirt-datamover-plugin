@@ -104,8 +104,6 @@ func TestBackupPlugin_Execute_PVCWithoutVM(t *testing.T) {
 	assert.Empty(t, operationID)
 }
 
-}
-
 func TestBackupPlugin_Execute_PVCWithCbtVm(t *testing.T) {
 	plugin := NewBackupPlugin(newTestLogger())
 
