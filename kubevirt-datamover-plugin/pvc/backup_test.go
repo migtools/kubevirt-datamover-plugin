@@ -15,6 +15,7 @@
 package pvc
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/sirupsen/logrus"
@@ -25,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
 )
 
@@ -69,6 +71,34 @@ func TestBackupPlugin_Execute_NilBackup(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "backup object is nil")
+}
+
+func TestBackupPlugin_Execute_PVCWithoutVM(t *testing.T) {
+	plugin := NewBackupPlugin(newTestLogger())
+
+	pvc := createTestPVC(testNamespace, testPVCName)
+	item := pvcToUnstructured(t, pvc)
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-backup",
+			Namespace: "velero",
+		},
+	}
+
+	// In a clean test cluster (or a cluster without a VM using this PVC),
+	// this should be a no-op.
+	result, additionalItems, operationID, _, err := plugin.Execute(item, backup)
+
+	// This test requires a Kubernetes client. If it fails to get one,
+	// we skip the test as the environment is not configured for it.
+	if err != nil && strings.Contains(err.Error(), "failed to get controller-runtime client") {
+		t.Skipf("Skipping test, not running in a Kubernetes cluster or client setup failed: %v", err)
+	}
+
+	require.NoError(t, err)
+	assert.Equal(t, item, result, "should return item as-is")
+	assert.Nil(t, additionalItems)
+	assert.Empty(t, operationID)
 }
 
 // Helper functions
