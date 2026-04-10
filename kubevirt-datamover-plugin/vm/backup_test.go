@@ -476,7 +476,7 @@ func TestBackupPlugin_checkPreconditions(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			eligible, reason, err := plugin.checkPreconditions(tc.vm, tc.backup)
+			eligible, reason, err := CheckPreconditions(tc.vm, tc.backup, plugin.Log)
 			require.NoError(t, err)
 			assert.Equal(t, tc.expectedEligible, eligible)
 			if !tc.expectedEligible {
