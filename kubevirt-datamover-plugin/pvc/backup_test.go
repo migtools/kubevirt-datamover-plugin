@@ -17,11 +17,22 @@ package pvc
 import (
 	"testing"
 
+	"testing"
+
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+)
+
+const (
+	testNamespace = "test-namespace"
+	testPVCName   = "test-pvc"
 )
 
 // newTestLogger creates a logger for tests that discards output.
@@ -48,4 +59,39 @@ func TestBackupPlugin_Name(t *testing.T) {
 	name := plugin.Name()
 
 	assert.Equal(t, "kubevirt-pvc-backup-plugin", name)
+}
+
+func TestBackupPlugin_Execute_NilBackup(t *testing.T) {
+	plugin := NewBackupPlugin(newTestLogger())
+
+	pvc := createTestPVC(testNamespace, testPVCName)
+	item := pvcToUnstructured(t, pvc)
+
+	_, _, _, _, err := plugin.Execute(item, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "backup object is nil")
+}
+
+// Helper functions
+
+// createTestPVC creates a test PVC.
+func createTestPVC(namespace, name string) *corev1.PersistentVolumeClaim {
+	return &corev1.PersistentVolumeClaim{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "PersistentVolumeClaim",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{},
+	}
+}
+
+func pvcToUnstructured(t *testing.T, pvc *corev1.PersistentVolumeClaim) runtime.Unstructured {
+	pvcMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pvc)
+	require.NoError(t, err)
+	return &unstructured.Unstructured{Object: pvcMap}
 }
