@@ -15,20 +15,34 @@
 package pvc
 
 import (
+	"context"
 	"fmt"
+	"sync"
 
+
+	controllercommon "github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	"github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/clients"
+	vmplugin "github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/vm"
 	"github.com/sirupsen/logrus"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+
+	kvcore "kubevirt.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // BackupPlugin is a BackupItemAction plugin for PersistentVolumeClaim resources.
 type BackupPlugin struct {
 	Log logrus.FieldLogger
+	// map[namespace]->[map[vmVolumes]->[]vmName]
+	nsPVCs map[string]map[string][]string
+	lock  sync.Mutex
+	
 }
+
 
 // NewBackupPlugin creates a new BackupPlugin instance.
 func NewBackupPlugin(log logrus.FieldLogger) *BackupPlugin {
@@ -66,8 +80,77 @@ func (p *BackupPlugin) Execute(
 	}
 
 	p.Log.Infof("[pvc-backup] Processing PersistentVolumeClaim %s/%s", pvc.Namespace, pvc.Name)
+	// Get VMs for this volume, if any
+	crClient, err := clients.CRClient()
+	if err != nil {
+		return item, nil, "", nil, fmt.Errorf("failed to get controller-runtime client: %w", err)
+	}
+	pvcs, err := p.getPVCList(crClient, pvc.Namespace)
+	if err != nil {
+		return item, nil, "", nil, fmt.Errorf("failed to get PVC list: %w", err)
+	}
+	kubevirtDMVM := ""
+	vmNames := pvcs[pvc.Name]
+	for _, vmName := range vmNames {
+		vm := new(kvcore.VirtualMachine)
+		err := crClient.Get(context.Background(), crclient.ObjectKey{Name: vmName, Namespace: pvc.Namespace}, vm)
+		if err != nil {
+			return item, nil, "", nil, fmt.Errorf("failed to get VM %s: %w", vmName, err)
+		}
+		eligible, _, err := vmplugin.CheckPreconditions(vm, backup, p.Log)
+		if err != nil {
+			return item, nil, "", nil, fmt.Errorf("failed to check preconditions: %w", err)
+		}
+		if eligible {
+			kubevirtDMVM = vmName
+			break
+		}
+	}
+	// return without further action if this volume isn't attached to a kubevirt DM VM
+	if kubevirtDMVM == "" {
+		return item, nil, "", nil, nil
+	}
+	// If this PVC is shared across multiple VMs and is supposed to use kubevirt DM, error out
+	if len(vmNames) > 1 {
+		return item, nil, "", nil, fmt.Errorf("Kubevirt datamover does not support volumes shared across VMs. Use velero datamover for %v", pvc.Name)
+	}
+	if pvc.Annotations == nil {
+		pvc.Annotations = make(map[string]string)
+		pvc.Annotations[controllercommon.AnnotationVMName] = vmNames[0]
+	}
+	// Convert back to unstructured
+	pvcMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pvc)
+	if err != nil {
+		return nil, nil, "", nil, fmt.Errorf("failed to convert PVC to unstructured: %w", err)
+	}
+	
+	return &unstructured.Unstructured{Object: pvcMap}, nil, "", nil, nil
+}
 
-	return item, nil, "", nil, nil
+func (p *BackupPlugin) getPVCList(crClient crclient.Client, ns string) (map[string][]string, error) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if p.nsPVCs == nil {
+		p.nsPVCs = make(map[string]map[string][]string)
+	}
+	pvcList, ok := p.nsPVCs[ns]
+	if ok {
+		return pvcList, nil
+	}
+	pvcList = make(map[string][]string)
+	vms := new(kvcore.VirtualMachineList)
+	err := crClient.List(context.Background(), vms, crclient.InNamespace(ns))
+	if err != nil {
+		return nil, fmt.Errorf("failed to list VMsL %w", err)
+	}
+	for i := range vms.Items {
+		pvcNames := controllercommon.GetVolumesForVm(&vms.Items[i])
+		for _, volume := range pvcNames {
+			pvcList[volume] = append(pvcList[volume], vms.Items[i].Name)
+		}
+	}
+	p.nsPVCs[ns] = pvcList
+	return pvcList, nil
 }
 
 // Progress is not implemented for this plugin.
