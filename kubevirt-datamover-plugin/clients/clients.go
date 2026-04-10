@@ -86,6 +86,13 @@ func CRClient() (crclient.Client, error) {
 	return crClient, crClientError
 }
 
+// SetCRClient allows setting a mock controller-runtime client for testing.
+// Pass nil to reset the client.
+func SetCRClient(client crclient.Client) {
+	crClient = client
+	crClientError = nil
+}
+
 func newCRClient() (crclient.Client, error) {
 	config, err := GetInClusterConfig()
 	if err != nil {
