@@ -124,16 +124,35 @@ func TestBackupPlugin_Execute_PVCWithCbtVm(t *testing.T) {
 	pvc.Status.Phase = corev1.ClaimBound
 	pv := createTestPV(pvName, pvc)
 
+	// Create the volume policy ConfigMap
+	const volumePolicyYAML = `
+# currently only supports v1 version
+version: v1
+volumePolicies:
+- conditions: {}
+  action:
+    type: skip
+`
+	volumePolicyCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "volume-policy",
+			Namespace: "velero", // Velero's namespace from the backup object
+		},
+		Data: map[string]string{
+			"volume-policy.yaml": volumePolicyYAML,
+		},
+	}
+
 	// Setup fake clients
 	scheme := runtime.NewScheme()
 	require.NoError(t, kvcore.AddToScheme(scheme))
 	require.NoError(t, corev1.AddToScheme(scheme))
 
-	fakeCrClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vm, pv, pvc).Build()
+	fakeCrClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vm, pv, pvc, volumePolicyCM).Build()
 	clients.SetCRClient(fakeCrClient)
 	defer clients.SetCRClient(nil) // Cleanup
 
-	fakeCoreClientset := k8sfake.NewSimpleClientset(pvc, pv)
+	fakeCoreClientset := k8sfake.NewSimpleClientset(pvc, pv, volumePolicyCM)
 	clients.SetCoreClient(fakeCoreClientset.CoreV1())
 	defer clients.SetCoreClient(nil)
 
