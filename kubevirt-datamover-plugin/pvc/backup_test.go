@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	kvcore "kubevirt.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -85,9 +86,13 @@ func TestBackupPlugin_Execute_PVCWithoutVM(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, kvcore.AddToScheme(scheme))
 	require.NoError(t, corev1.AddToScheme(scheme))
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	clients.SetCRClient(fakeClient)
+	fakeCrClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	clients.SetCRClient(fakeCrClient)
 	defer clients.SetCRClient(nil)
+
+	fakeCoreClientset := k8sfake.NewSimpleClientset()
+	clients.SetCoreClient(fakeCoreClientset.CoreV1())
+	defer clients.SetCoreClient(nil)
 
 	pvc := createTestPVC(testNamespace, testPVCName)
 	item := pvcToUnstructured(t, pvc)
@@ -114,18 +119,18 @@ func TestBackupPlugin_Execute_PVCWithCbtVm(t *testing.T) {
 	vm := createTestVMWithCBT(testNamespace, vmName, testPVCName)
 	pvc := createTestPVC(testNamespace, testPVCName)
 
-	// Setup fake client
+	// Setup fake clients
 	scheme := runtime.NewScheme()
 	require.NoError(t, kvcore.AddToScheme(scheme))
 	require.NoError(t, corev1.AddToScheme(scheme))
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	clients.SetCRClient(fakeClient)
+	fakeCrClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vm, pvc).Build()
+	clients.SetCRClient(fakeCrClient)
 	defer clients.SetCRClient(nil) // Cleanup
 
-	// Create objects in the fake cluster
-	require.NoError(t, fakeClient.Create(context.Background(), vm))
-	require.NoError(t, fakeClient.Create(context.Background(), pvc))
+	fakeCoreClientset := k8sfake.NewSimpleClientset(pvc)
+	clients.SetCoreClient(fakeCoreClientset.CoreV1())
+	defer clients.SetCoreClient(nil)
 
 	// Setup for plugin execution
 	item := pvcToUnstructured(t, pvc)
