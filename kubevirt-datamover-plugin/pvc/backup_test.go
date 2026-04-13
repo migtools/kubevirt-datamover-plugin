@@ -16,7 +16,6 @@ package pvc
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/sirupsen/logrus"
@@ -82,8 +81,11 @@ func TestBackupPlugin_Execute_NilBackup(t *testing.T) {
 func TestBackupPlugin_Execute_PVCWithoutVM(t *testing.T) {
 	plugin := NewBackupPlugin(newTestLogger())
 
-	// Setup fake client with no VMs
-	fakeClient := fake.NewClientBuilder().Build()
+	// Setup fake client
+	scheme := runtime.NewScheme()
+	require.NoError(t, kvcore.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 	clients.SetCRClient(fakeClient)
 	defer clients.SetCRClient(nil)
 
@@ -141,7 +143,7 @@ func TestBackupPlugin_Execute_PVCWithCbtVm(t *testing.T) {
 	result, _, _, _, err := plugin.Execute(item, backup)
 	require.NoError(t, err)
 
-	annotations := result.GetAnnotations()
+	annotations := result.(*unstructured.Unstructured).GetAnnotations()
 	require.NotNil(t, annotations)
 	assert.Equal(t, vmName, annotations[controllercommon.AnnotationVMName])
 }
