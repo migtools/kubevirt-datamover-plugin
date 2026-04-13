@@ -15,7 +15,6 @@
 package pvc
 
 import (
-	"context"
 	"testing"
 
 	"github.com/sirupsen/logrus"
