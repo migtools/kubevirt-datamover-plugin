@@ -116,8 +116,8 @@ func (p *BackupPlugin) Execute(
 	}
 	if pvc.Annotations == nil {
 		pvc.Annotations = make(map[string]string)
-		pvc.Annotations[controllercommon.AnnotationVMName] = vmNames[0]
 	}
+	pvc.Annotations[controllercommon.AnnotationVMName] = vmNames[0]
 	// Convert back to unstructured
 	pvcMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pvc)
 	if err != nil {
