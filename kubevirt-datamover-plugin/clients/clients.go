@@ -16,13 +16,14 @@ package clients
 
 import (
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-var coreClient *corev1.CoreV1Client
+var coreClient corev1.CoreV1Interface
 var coreClientError error
 
 var crClient crclient.Client
@@ -49,33 +50,40 @@ func GetInClusterConfig() (*rest.Config, error) {
 }
 
 // CoreClient returns a kubernetes CoreV1Client (singleton)
-func CoreClient() (*corev1.CoreV1Client, error) {
+func CoreClient() (corev1.CoreV1Interface, error) {
 	if coreClient == nil && coreClientError == nil {
 		coreClient, coreClientError = newCoreClient()
 	}
 	return coreClient, coreClientError
 }
 
+// SetCoreClient allows setting a mock core client for testing.
+// Pass nil to reset the client.
+func SetCoreClient(client corev1.CoreV1Interface) {
+	coreClient = client
+	coreClientError = nil
+}
+
 // CoreClientFromConfig creates a CoreV1Client from the given config
-func CoreClientFromConfig(config *rest.Config) (*corev1.CoreV1Client, error) {
-	client, err := corev1.NewForConfig(config)
+func CoreClientFromConfig(config *rest.Config) (corev1.CoreV1Interface, error) {
+	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return nil, err
 	}
-	coreClient = client
-	return client, nil
+	coreClient = clientset.CoreV1()
+	return coreClient, nil
 }
 
-func newCoreClient() (*corev1.CoreV1Client, error) {
+func newCoreClient() (corev1.CoreV1Interface, error) {
 	config, err := GetInClusterConfig()
 	if err != nil {
 		return nil, err
 	}
-	client, err := corev1.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return nil, err
 	}
-	return client, nil
+	return clientset.CoreV1(), nil
 }
 
 // CRClient returns a controller-runtime client (singleton)
