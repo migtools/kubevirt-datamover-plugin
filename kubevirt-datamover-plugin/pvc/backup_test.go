@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -115,8 +116,13 @@ func TestBackupPlugin_Execute_PVCWithCbtVm(t *testing.T) {
 
 	// This is a unit test that uses a fake client.
 	const vmName = "test-vm-for-pvc-backup"
+	const pvName = "test-pv"
 	vm := createTestVMWithCBT(testNamespace, vmName, testPVCName)
 	pvc := createTestPVC(testNamespace, testPVCName)
+	pvc.UID = "test-pvc-uid"
+	pvc.Spec.VolumeName = pvName
+	pvc.Status.Phase = corev1.ClaimBound
+	pv := createTestPV(pvName, pvc)
 
 	// Setup fake clients
 	scheme := runtime.NewScheme()
@@ -127,7 +133,7 @@ func TestBackupPlugin_Execute_PVCWithCbtVm(t *testing.T) {
 	clients.SetCRClient(fakeCrClient)
 	defer clients.SetCRClient(nil) // Cleanup
 
-	fakeCoreClientset := k8sfake.NewSimpleClientset(pvc)
+	fakeCoreClientset := k8sfake.NewSimpleClientset(pvc, pv)
 	clients.SetCoreClient(fakeCoreClientset.CoreV1())
 	defer clients.SetCoreClient(nil)
 
@@ -170,7 +176,16 @@ func createTestPVC(namespace, name string) *corev1.PersistentVolumeClaim {
 			Name:      name,
 			Namespace: namespace,
 		},
-		Spec: corev1.PersistentVolumeClaimSpec{},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{
+				corev1.ReadWriteOnce,
+			},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
 	}
 }
 
@@ -226,4 +241,30 @@ func createTestVMWithCBT(namespace, name, pvcName string) *kvcore.VirtualMachine
 		},
 	}
 	return vm
+}
+
+// createTestPV creates a test PV bound to a PVC.
+func createTestPV(name string, pvc *corev1.PersistentVolumeClaim) *corev1.PersistentVolume {
+	return &corev1.PersistentVolume{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "PersistentVolume",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			ClaimRef: &corev1.ObjectReference{
+				Namespace: pvc.Namespace,
+				Name:      pvc.Name,
+				UID:       pvc.UID,
+			},
+			Capacity:                      pvc.Spec.Resources.Requests,
+			AccessModes:                   pvc.Spec.AccessModes,
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain,
+		},
+		Status: corev1.PersistentVolumeStatus{
+			Phase: corev1.VolumeBound,
+		},
+	}
 }
