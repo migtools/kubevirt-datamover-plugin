@@ -129,7 +129,7 @@ func TestBackupPlugin_Execute_PVCWithCbtVm(t *testing.T) {
 	require.NoError(t, kvcore.AddToScheme(scheme))
 	require.NoError(t, corev1.AddToScheme(scheme))
 
-	fakeCrClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vm, pvc).Build()
+	fakeCrClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vm, pv, pvc).Build()
 	clients.SetCRClient(fakeCrClient)
 	defer clients.SetCRClient(nil) // Cleanup
 
