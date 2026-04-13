@@ -146,6 +146,10 @@ func TestBackupPlugin_Execute_PVCWithCbtVm(t *testing.T) {
 		},
 		Spec: velerov1.BackupSpec{
 			SnapshotMoveData: boolPtr(true),
+			ResourcePolicy: &corev1.TypedLocalObjectReference{
+				Kind: "configmap",
+				Name: "volume-policy",
+			},
 		},
 	}
 
