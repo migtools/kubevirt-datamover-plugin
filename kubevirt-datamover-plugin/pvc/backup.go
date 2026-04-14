@@ -117,6 +117,7 @@ func (p *BackupPlugin) Execute(
 	if pvc.Annotations == nil {
 		pvc.Annotations = make(map[string]string)
 	}
+	p.Log.Infof("[pvc-backup] Adding VMName annotation %s to PersistentVolumeClaim %s/%s", vmNames[0], pvc.Namespace, pvc.Name)
 	pvc.Annotations[controllercommon.AnnotationVMName] = vmNames[0]
 	// Convert back to unstructured
 	pvcMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pvc)
@@ -141,7 +142,7 @@ func (p *BackupPlugin) getPVCList(crClient crclient.Client, ns string) (map[stri
 	vms := new(kvcore.VirtualMachineList)
 	err := crClient.List(context.Background(), vms, crclient.InNamespace(ns))
 	if err != nil {
-		return nil, fmt.Errorf("failed to list VMsL %w", err)
+		return nil, fmt.Errorf("failed to list VMs: %w", err)
 	}
 	for i := range vms.Items {
 		pvcNames := controllercommon.GetVolumesForVm(&vms.Items[i])
