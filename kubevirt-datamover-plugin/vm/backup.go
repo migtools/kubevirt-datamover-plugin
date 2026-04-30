@@ -637,12 +637,9 @@ func buildDataUploadAnnotations(vm *kvcore.VirtualMachine, operationID string) m
 
 	// Propagate backup-pvc-size from VM annotation to DataUpload so the
 	// controller can use it to size the temporary backup PVC per-VM.
-	// TODO: Replace with controllercommon.AnnotationBackupPVCSize after bumping
-	// the kubevirt-datamover-controller dependency to include PR #61.
-	const annotationBackupPVCSize = "kubevirt-datamover.io/backup-pvc-size"
 	if vm.Annotations != nil {
-		if size := vm.Annotations[annotationBackupPVCSize]; size != "" {
-			annotations[annotationBackupPVCSize] = size
+		if size := vm.Annotations[controllercommon.AnnotationBackupPVCSize]; size != "" {
+			annotations[controllercommon.AnnotationBackupPVCSize] = size
 		}
 	}
 
