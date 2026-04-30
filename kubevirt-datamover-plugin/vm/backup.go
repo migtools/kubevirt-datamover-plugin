@@ -461,12 +461,7 @@ func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *veler
 			Labels: map[string]string{
 				velerov1.BackupNameLabel: controllercommon.SafeLabelValue(backup.Name),
 			},
-			Annotations: map[string]string{
-				// Use controller common constants for annotations that the controller reads
-				controllercommon.AnnotationVMName:      vm.Name,
-				controllercommon.AnnotationVMNamespace: vm.Namespace,
-				controllercommon.AnnotationOperationID: operationID,
-			},
+			Annotations: buildDataUploadAnnotations(vm, operationID),
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: "velero.io/v1",
@@ -628,6 +623,30 @@ func (p *BackupPlugin) updateDataUpload(du *velerov2alpha1.DataUpload) error {
 	}
 
 	return nil
+}
+
+// buildDataUploadAnnotations constructs the annotation map for a DataUpload CR.
+// It includes required controller annotations and propagates optional per-VM
+// annotations (like backup-pvc-size) from the VM to the DataUpload.
+func buildDataUploadAnnotations(vm *kvcore.VirtualMachine, operationID string) map[string]string {
+	annotations := map[string]string{
+		controllercommon.AnnotationVMName:      vm.Name,
+		controllercommon.AnnotationVMNamespace: vm.Namespace,
+		controllercommon.AnnotationOperationID: operationID,
+	}
+
+	// Propagate backup-pvc-size from VM annotation to DataUpload so the
+	// controller can use it to size the temporary backup PVC per-VM.
+	// TODO: Replace with controllercommon.AnnotationBackupPVCSize after bumping
+	// the kubevirt-datamover-controller dependency to include PR #61.
+	const annotationBackupPVCSize = "kubevirt-datamover.io/backup-pvc-size"
+	if vm.Annotations != nil {
+		if size := vm.Annotations[annotationBackupPVCSize]; size != "" {
+			annotations[annotationBackupPVCSize] = size
+		}
+	}
+
+	return annotations
 }
 
 // generateOperationID creates a unique operation ID for tracking async operations.
