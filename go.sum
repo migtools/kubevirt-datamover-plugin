@@ -167,8 +167,8 @@ github.com/mattn/go-isatty v0.0.8/go.mod h1:Iq45c/XA43vh69/j3iqttzPXn0bhXyGjM0Hd
 github.com/mattn/go-isatty v0.0.10/go.mod h1:qgIWMr58cqv1PHHyhnkY9lrL7etaEgOFcMEpPG5Rm84=
 github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
-github.com/migtools/kubevirt-datamover-controller v0.0.0-20260413211236-4ef956e18201 h1:v/N98zXzGYoJOBFssheJWmxuiQcyiBLNXngMLvBC/BM=
-github.com/migtools/kubevirt-datamover-controller v0.0.0-20260413211236-4ef956e18201/go.mod h1:ij8ETxVonpqrOoQM2f6xbUQ2I5Obva+f4IHIswIahSc=
+github.com/migtools/kubevirt-datamover-controller v0.0.0-20260430185232-078320a198ab h1:c5zXuWhLZjJ/5K9j48xOjlysHFIGOBH38hawTPifTDU=
+github.com/migtools/kubevirt-datamover-controller v0.0.0-20260430185232-078320a198ab/go.mod h1:ij8ETxVonpqrOoQM2f6xbUQ2I5Obva+f4IHIswIahSc=
 github.com/mitchellh/go-testing-interface v1.0.0 h1:fzU/JVNcaqHQEcVFAKeR41fkiLdIPrefOvVG1VZ96U0=
 github.com/mitchellh/go-testing-interface v1.0.0/go.mod h1:kRemZodwjscx+RGhAo8eIhFbs2+BFgRtFPeD/KE+zxI=
 github.com/mitchellh/mapstructure v1.1.2/go.mod h1:FVVH3fgwuzCH5S8UJGiWEs2h04kUh9fWfEaFds41c1Y=

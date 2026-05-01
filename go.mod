@@ -4,7 +4,7 @@ go 1.25.7
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260413211236-4ef956e18201
+	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260430185232-078320a198ab
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.11.1
 	github.com/vmware-tanzu/velero v1.15.0
