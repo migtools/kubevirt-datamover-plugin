@@ -569,3 +569,56 @@ func vmToUnstructured(t *testing.T, vm *kvcore.VirtualMachine) runtime.Unstructu
 	require.NoError(t, err)
 	return &unstructured.Unstructured{Object: vmMap}
 }
+
+func TestBuildDataUploadAnnotations(t *testing.T) {
+	operationID := "test-op-123"
+
+	t.Run("includes required annotations", func(t *testing.T) {
+		vm := &kvcore.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-vm",
+				Namespace: "my-ns",
+			},
+		}
+
+		annotations := buildDataUploadAnnotations(vm, operationID)
+
+		assert.Equal(t, "my-vm", annotations[controllercommon.AnnotationVMName])
+		assert.Equal(t, "my-ns", annotations[controllercommon.AnnotationVMNamespace])
+		assert.Equal(t, operationID, annotations[controllercommon.AnnotationOperationID])
+		assert.NotContains(t, annotations, "kubevirt-datamover.io/backup-pvc-size")
+	})
+
+	t.Run("propagates backup-pvc-size from VM", func(t *testing.T) {
+		vm := &kvcore.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-vm",
+				Namespace: "my-ns",
+				Annotations: map[string]string{
+					"kubevirt-datamover.io/backup-pvc-size": "50Gi",
+				},
+			},
+		}
+
+		annotations := buildDataUploadAnnotations(vm, operationID)
+
+		assert.Equal(t, "50Gi", annotations["kubevirt-datamover.io/backup-pvc-size"])
+		assert.Equal(t, "my-vm", annotations[controllercommon.AnnotationVMName])
+	})
+
+	t.Run("ignores empty backup-pvc-size annotation", func(t *testing.T) {
+		vm := &kvcore.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-vm",
+				Namespace: "my-ns",
+				Annotations: map[string]string{
+					"kubevirt-datamover.io/backup-pvc-size": "",
+				},
+			},
+		}
+
+		annotations := buildDataUploadAnnotations(vm, operationID)
+
+		assert.NotContains(t, annotations, "kubevirt-datamover.io/backup-pvc-size")
+	})
+}
