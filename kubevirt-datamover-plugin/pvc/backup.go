@@ -117,8 +117,8 @@ func (p *BackupPlugin) Execute(
 	if pvc.Annotations == nil {
 		pvc.Annotations = make(map[string]string)
 	}
-	p.Log.Infof("[pvc-backup] Adding VMName annotation %s to PersistentVolumeClaim %s/%s", vmNames[0], pvc.Namespace, pvc.Name)
-	pvc.Annotations[controllercommon.AnnotationVMName] = vmNames[0]
+	p.Log.Infof("[pvc-backup] Adding VMName annotation %s to PersistentVolumeClaim %s/%s", kubevirtDMVM, pvc.Namespace, pvc.Name)
+	pvc.Annotations[controllercommon.AnnotationVMName] = kubevirtDMVM
 	// Convert back to unstructured
 	pvcMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pvc)
 	if err != nil {
