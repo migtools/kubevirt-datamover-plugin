@@ -50,5 +50,5 @@ func newPVCBackupPlugin(logger logrus.FieldLogger) (interface{}, error) {
 
 // newVMDeletePlugin creates a new VirtualMachine DeleteItemAction plugin.
 func newVMDeletePlugin(logger logrus.FieldLogger) (interface{}, error) {
-	return vm.NewDeletePlugin(logger), nil
+	return vm.NewDeletePlugin(logger, nil), nil
 }
