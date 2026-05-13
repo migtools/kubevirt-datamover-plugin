@@ -71,7 +71,6 @@ func (p *DeletePlugin) Execute(input *velero.DeleteItemActionExecuteInput) error
 		return fmt.Errorf("failed to get object store from BSL: %w", err)
 	}
 
-	_ = objectStore // Available for use
 	// read per-backup-per-vm manifest
 	vmBackupManifest, found, err := uploader.GetVMBackupManifest(objectStore, vm.Namespace, vm.Name, input.Backup.Name, cfg.Bucket, logrusr.New(p.Log))
 	if err != nil {
@@ -90,12 +89,11 @@ func (p *DeletePlugin) Execute(input *velero.DeleteItemActionExecuteInput) error
 	// iterate over checkpoints
 	if found {
 		n := 0
-		// first iteration to remove ReferencedBy
 		for _, checkpoint := range vmIndex.Checkpoints {
 			//   for each referenced checkpoint, remove this backup from referencedBy
 			if slices.Contains(checkpointNames, checkpoint.ID) {
 				slices.DeleteFunc(checkpoint.ReferencedBy, func(e string) bool {
-					return e == checkpoint.ID
+					return e == input.Backup.Name
 				})
 			}
 			//   if referencedBy empty
@@ -106,16 +104,24 @@ func (p *DeletePlugin) Execute(input *velero.DeleteItemActionExecuteInput) error
 						return fmt.Errorf("failed to delete qcow file from BSL: %w", err)
 					}
 				}
-				//      remove checkpoint entry
+			} else {
+				//      keep checkpoint entry
 				vmIndex.Checkpoints[n] = checkpoint
 				n++
 			}
 		}
 		vmIndex.Checkpoints = vmIndex.Checkpoints[:n]
 		// write per-vm manifest (delete if no checkpoints left)
-		err = uploader.PutVMIndex(objectStore, vm.Namespace, vm.Name, cfg.Bucket, vmIndex)
-		if err != nil {
-			return fmt.Errorf("failed to write VM index to BSL: %w", err)
+		if len(vmIndex.Checkpoints) > 0 {
+			err = uploader.PutVMIndex(objectStore, vm.Namespace, vm.Name, cfg.Bucket, vmIndex)
+			if err != nil {
+				return fmt.Errorf("failed to write VM index to BSL: %w", err)
+			}
+		} else {
+			err = uploader.DeleteVMIndex(objectStore, vm.Namespace, vm.Name, cfg.Bucket)
+			if err != nil {
+				return fmt.Errorf("failed to write VM index to BSL: %w", err)
+			}
 		}
 	}
 	// read per-backup manifest
