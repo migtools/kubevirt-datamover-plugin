@@ -110,4 +110,4 @@ require (
 // Use same velero fork as the controller for compatibility
 replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20250313160323-584cf1148a74
 
-replace github.com/migtools/kubevirt-datamover-controller => github.com/sseago/kubevirt-datamover-controller v0.0.0-20260511184237-5a9cb7c7d453
+replace github.com/migtools/kubevirt-datamover-controller => github.com/sseago/kubevirt-datamover-controller v0.0.0-20260515180935-fefef0b173d6
