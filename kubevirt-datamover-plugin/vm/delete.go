@@ -92,7 +92,7 @@ func (p *DeletePlugin) Execute(input *velero.DeleteItemActionExecuteInput) error
 		for _, checkpoint := range vmIndex.Checkpoints {
 			//   for each referenced checkpoint, remove this backup from referencedBy
 			if slices.Contains(checkpointNames, checkpoint.ID) {
-				slices.DeleteFunc(checkpoint.ReferencedBy, func(e string) bool {
+				checkpoint.ReferencedBy = slices.DeleteFunc(checkpoint.ReferencedBy, func(e string) bool {
 					return e == input.Backup.Name
 				})
 			}
@@ -103,6 +103,12 @@ func (p *DeletePlugin) Execute(input *velero.DeleteItemActionExecuteInput) error
 					if err := uploader.DeleteQCOW(objectStore, vm.Namespace, vm.Name, checkpoint.ID, qcowFile.Filename, cfg.Bucket); err != nil {
 						return fmt.Errorf("failed to delete qcow file from BSL: %w", err)
 					}
+				}
+				if err := uploader.DeleteVMB(objectStore, vm.Namespace, vm.Name, checkpoint.ID, cfg.Bucket); err != nil {
+					return fmt.Errorf("failed to delete vmb from BSL: %w", err)
+				}
+				if err := uploader.DeleteVMBT(objectStore, vm.Namespace, vm.Name, checkpoint.ID, cfg.Bucket); err != nil {
+					return fmt.Errorf("failed to delete vmbt from BSL: %w", err)
 				}
 			} else {
 				//      keep checkpoint entry
@@ -131,7 +137,7 @@ func (p *DeletePlugin) Execute(input *velero.DeleteItemActionExecuteInput) error
 	}
 	if found {
 		// remove vm
-		slices.DeleteFunc(backupManifest.VMs, func(e uploader.VMBackupReference) bool {
+		backupManifest.VMs = slices.DeleteFunc(backupManifest.VMs, func(e uploader.VMBackupReference) bool {
 			return e.Name == vm.Name
 		})
 		// write per-backup manifest (delete if no VMs left)
