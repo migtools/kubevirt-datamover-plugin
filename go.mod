@@ -1,10 +1,10 @@
 module github.com/migtools/kubevirt-datamover-plugin
 
-go 1.25.7
+go 1.25.0
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260430185232-078320a198ab
+	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260514151904-95582f054e18
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.11.1
 	github.com/vmware-tanzu/velero v1.15.0
@@ -87,4 +87,4 @@ require (
 )
 
 // Use same velero fork as the controller for compatibility
-replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20260413161955-ea34d4d90057
+replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20260512112741-1507da80091a
