@@ -77,6 +77,7 @@ func (p *DeletePlugin) Execute(input *velero.DeleteItemActionExecuteInput) error
 		return fmt.Errorf("failed to get VM backup manifest BSL: %w", err)
 	}
 	if !found {
+		p.Log.Infof("[vm-delete] no VM backup manifest found for %s/%s in backup %s, skipping", vm.Namespace, vm.Name, input.Backup.Name)
 		return nil
 	}
 	// get checkpoint list
@@ -138,7 +139,7 @@ func (p *DeletePlugin) Execute(input *velero.DeleteItemActionExecuteInput) error
 	if found {
 		// remove vm
 		backupManifest.VMs = slices.DeleteFunc(backupManifest.VMs, func(e uploader.VMBackupReference) bool {
-			return e.Name == vm.Name
+			return e.Name == vm.Name && e.Namespace == vm.Namespace
 		})
 		// write per-backup manifest (delete if no VMs left)
 		if len(backupManifest.VMs) == 0 {
