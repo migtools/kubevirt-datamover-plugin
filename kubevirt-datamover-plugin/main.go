@@ -18,6 +18,7 @@ import (
 	"github.com/sirupsen/logrus"
 	veleroplugin "github.com/vmware-tanzu/velero/pkg/plugin/framework"
 
+	"github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/pvc"
 	"github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/vm"
 )
 
@@ -28,6 +29,7 @@ func main() {
 		// (CBT enabled, VM running, kubevirt volume policy) and creating DataUpload CRs
 		// for incremental backup via the kubevirt datamover controller.
 		RegisterBackupItemActionV2("kubevirt.io/01-vm-datamover-backup-plugin", newVMBackupPlugin).
+		RegisterBackupItemActionV2("kubevirt.io/02-pvc-datamover-backup-plugin", newPVCBackupPlugin).
 		Serve()
 }
 
@@ -38,4 +40,9 @@ func main() {
 // - Tracking async operation progress via the DataUpload status
 func newVMBackupPlugin(logger logrus.FieldLogger) (interface{}, error) {
 	return vm.NewBackupPlugin(logger), nil
+}
+
+// newPVCBackupPlugin creates a new PVC BackupItemAction plugin.
+func newPVCBackupPlugin(logger logrus.FieldLogger) (interface{}, error) {
+	return pvc.NewBackupPlugin(logger), nil
 }
