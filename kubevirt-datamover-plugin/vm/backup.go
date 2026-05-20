@@ -34,6 +34,7 @@ import (
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	"github.com/vmware-tanzu/velero/pkg/kuberesource"
+	"github.com/vmware-tanzu/velero/pkg/label"
 	"github.com/vmware-tanzu/velero/pkg/plugin/utils/volumehelper"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
 
@@ -97,7 +98,7 @@ func (p *BackupPlugin) Execute(
 	p.Log.Infof("[vm-backup] Processing VirtualMachine %s/%s", vm.Namespace, vm.Name)
 
 	// Check preconditions
-	eligible, reason, err := p.checkPreconditions(vm, backup)
+	eligible, reason, err := CheckPreconditions(vm, backup, p.Log)
 	if err != nil {
 		return nil, nil, "", nil, fmt.Errorf("failed to check preconditions: %w", err)
 	}
@@ -135,6 +136,7 @@ func (p *BackupPlugin) Execute(
 	}
 	vm.Annotations[velerov1.DataUploadNameAnnotation] = dataUpload.Name
 	vm.Annotations[controllercommon.AnnotationOperationID] = operationID
+	vm.Annotations[velerov1.PVCNamespaceNameLabel] = label.GetValidName(fmt.Sprintf("%s.%s", sourcePVC.Namespace, sourcePVC.Name))
 
 	// Convert back to unstructured
 	vmMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(vm)
@@ -252,9 +254,9 @@ func (p *BackupPlugin) Cancel(operationID string, backup *velerov1.Backup) error
 	return nil
 }
 
-// checkPreconditions verifies that the VirtualMachine meets all requirements
+// CheckPreconditions verifies that the VirtualMachine meets all requirements
 // for kubevirt datamover backup.
-func (p *BackupPlugin) checkPreconditions(vm *kvcore.VirtualMachine, backup *velerov1.Backup) (bool, string, error) {
+func CheckPreconditions(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log logrus.FieldLogger) (bool, string, error) {
 	// Check 1: SnapshotMoveData must be true
 	if backup.Spec.SnapshotMoveData == nil || !*backup.Spec.SnapshotMoveData {
 		return false, "backup.Spec.SnapshotMoveData is not enabled", nil
@@ -278,7 +280,7 @@ func (p *BackupPlugin) checkPreconditions(vm *kvcore.VirtualMachine, backup *vel
 	// TODO(https://github.com/migtools/kubevirt-datamover-plugin/issues/4): Once upstream
 	// Velero changes are merged, update this to check for "custom" action type and inspect
 	// the action parameters map to verify it's for kubevirt.
-	hasKubevirtPolicy, hasConflictingPolicy, err := p.checkVolumePolicies(vm, backup)
+	hasKubevirtPolicy, hasConflictingPolicy, err := checkVolumePolicies(vm, backup, log)
 	if err != nil {
 		return false, "", fmt.Errorf("failed to check volume policies: %w", err)
 	}
@@ -305,11 +307,11 @@ func (p *BackupPlugin) checkPreconditions(vm *kvcore.VirtualMachine, backup *vel
 // Velero changes are merged, update hasKubevirtPolicy to check for "custom" action type
 // with kubevirt-specific parameter. For now, we assume kubevirt policy is true if there
 // are PVCs and none have snapshot policy.
-func (p *BackupPlugin) checkVolumePolicies(vm *kvcore.VirtualMachine, backup *velerov1.Backup) (bool, bool, error) {
+func checkVolumePolicies(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log logrus.FieldLogger) (bool, bool, error) {
 	// Get all PVCs associated with this VM using controller common function
 	pvcNames := controllercommon.GetVolumesForVm(vm)
 	if len(pvcNames) == 0 {
-		p.Log.Infof("[vm-backup] VirtualMachine %s/%s has no PVCs", vm.Namespace, vm.Name)
+		log.Infof("[vm-backup] VirtualMachine %s/%s has no PVCs", vm.Namespace, vm.Name)
 		return false, false, nil
 	}
 
@@ -332,7 +334,7 @@ func (p *BackupPlugin) checkVolumePolicies(vm *kvcore.VirtualMachine, backup *ve
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				// PVC doesn't exist yet (might be a DataVolume that hasn't created PVC yet)
-				p.Log.Infof("[vm-backup] PVC %s/%s not found, skipping", vm.Namespace, pvcName)
+				log.Infof("[vm-backup] PVC %s/%s not found, skipping", vm.Namespace, pvcName)
 				continue
 			}
 			// Other errors (RBAC, timeout, etc.) should be propagated
@@ -352,7 +354,7 @@ func (p *BackupPlugin) checkVolumePolicies(vm *kvcore.VirtualMachine, backup *ve
 			kuberesource.PersistentVolumeClaims,
 			*backup,
 			crClient,
-			p.Log,
+			log,
 		)
 		if err != nil {
 			return false, false, fmt.Errorf("failed to check volume policy for PVC %s: %w", pvcName, err)
@@ -361,7 +363,7 @@ func (p *BackupPlugin) checkVolumePolicies(vm *kvcore.VirtualMachine, backup *ve
 		if shouldSnapshot {
 			// This PVC has snapshot policy - conflicts with kubevirt datamover
 			hasConflictingPolicy = true
-			p.Log.Warnf("[vm-backup] PVC %s/%s has snapshot policy which conflicts with kubevirt datamover", vm.Namespace, pvcName)
+			log.Warnf("[vm-backup] PVC %s/%s has snapshot policy which conflicts with kubevirt datamover", vm.Namespace, pvcName)
 		}
 	}
 
