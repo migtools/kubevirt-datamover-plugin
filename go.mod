@@ -5,7 +5,7 @@ go 1.25.3
 require (
 	github.com/bombsimon/logrusr/v4 v4.1.0
 	github.com/google/uuid v1.6.0
-	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260430182149-84159002a6d9
+	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260522013711-0ce9b56ea341
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.11.1
 	github.com/vmware-tanzu/velero v1.15.0
@@ -109,5 +109,3 @@ require (
 
 // Use same velero fork as the controller for compatibility
 replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20250313160323-584cf1148a74
-
-replace github.com/migtools/kubevirt-datamover-controller => github.com/sseago/kubevirt-datamover-controller v0.0.0-20260515180935-fefef0b173d6
