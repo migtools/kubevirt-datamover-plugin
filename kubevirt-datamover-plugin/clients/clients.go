@@ -128,9 +128,6 @@ func newCRClient() (crclient.Client, error) {
 	return client, nil
 }
 
-func SetCRClient(inClient crclient.Client) {
-	crClient = inClient
-}
 func init() {
 	coreClient, coreClientError = nil, nil
 	crClient, crClientError = nil, nil
