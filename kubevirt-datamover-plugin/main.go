@@ -40,7 +40,7 @@ func main() {
 // - Creating DataUpload CRs with SnapshotType and DataMover set to "kubevirt"
 // - Tracking async operation progress via the DataUpload status
 func newVMBackupPlugin(logger logrus.FieldLogger) (interface{}, error) {
-	return vm.NewBackupPlugin(logger), nil
+	return vm.NewBackupPlugin(logger, nil)
 }
 
 // newPVCBackupPlugin creates a new PVC BackupItemAction plugin.
