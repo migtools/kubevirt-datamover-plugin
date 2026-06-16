@@ -15,10 +15,12 @@
 package clients
 
 import (
+	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	corev1scheme "k8s.io/api/core/v1"
 	"k8s.io/client-go/rest"
 	kvcore "kubevirt.io/api/core/v1"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -116,6 +118,8 @@ func newCRClient() (crclient.Client, error) {
 	if err := kvcore.AddToScheme(scheme); err != nil {
 		return nil, err
 	}
+        corev1scheme.AddToScheme(scheme)
+        velerov1.AddToScheme(scheme)
 
 	client, err := crclient.New(config, crclient.Options{Scheme: scheme})
 	if err != nil {

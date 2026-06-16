@@ -30,6 +30,7 @@ func main() {
 		// for incremental backup via the kubevirt datamover controller.
 		RegisterBackupItemActionV2("kubevirt.io/01-vm-datamover-backup-plugin", newVMBackupPlugin).
 		RegisterBackupItemActionV2("kubevirt.io/02-pvc-datamover-backup-plugin", newPVCBackupPlugin).
+		RegisterDeleteItemAction("kubevirt.io/01-vm-datamover-delete-plugin", newVMDeletePlugin).
 		Serve()
 }
 
@@ -45,4 +46,9 @@ func newVMBackupPlugin(logger logrus.FieldLogger) (interface{}, error) {
 // newPVCBackupPlugin creates a new PVC BackupItemAction plugin.
 func newPVCBackupPlugin(logger logrus.FieldLogger) (interface{}, error) {
 	return pvc.NewBackupPlugin(logger), nil
+}
+
+// newVMDeletePlugin creates a new VirtualMachine DeleteItemAction plugin.
+func newVMDeletePlugin(logger logrus.FieldLogger) (interface{}, error) {
+	return vm.NewDeletePlugin(logger, nil), nil
 }
