@@ -157,7 +157,7 @@ volumePolicies:
 	require.NoError(t, kvcore.AddToScheme(scheme))
 	require.NoError(t, corev1.AddToScheme(scheme))
 
-	fakeCrClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vm, pv, pvc, volumePolicyCM).Build()
+	var fakeCrClient crclient.Client = fake.NewClientBuilder().WithScheme(scheme).WithObjects(vm, pv, pvc, volumePolicyCM).Build()
 	clients.SetCRClient(fakeCrClient)
 	defer clients.SetCRClient(nil) // Cleanup
 
