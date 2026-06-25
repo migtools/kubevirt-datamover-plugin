@@ -93,11 +93,7 @@ func (p *BackupPlugin) Execute(
 
 	p.Log.Infof("[pvc-backup] Processing PersistentVolumeClaim %s/%s", pvc.Namespace, pvc.Name)
 	// Get VMs for this volume, if any
-	crClient, err := clients.CRClient()
-	if err != nil {
-		return item, nil, "", nil, fmt.Errorf("failed to get controller-runtime client: %w", err)
-	}
-	pvcs, err := p.getPVCList(crClient, pvc.Namespace)
+	pvcs, err := p.getPVCList(p.crClient, pvc.Namespace)
 	if err != nil {
 		return item, nil, "", nil, fmt.Errorf("failed to get PVC list: %w", err)
 	}
@@ -110,7 +106,7 @@ func (p *BackupPlugin) Execute(
 	vmNames := pvcs[pvc.Name]
 	for _, vmName := range vmNames {
 		vm := new(kvcore.VirtualMachine)
-		err := crClient.Get(context.Background(), crclient.ObjectKey{Name: vmName, Namespace: pvc.Namespace}, vm)
+		err := p.crClient.Get(context.Background(), crclient.ObjectKey{Name: vmName, Namespace: pvc.Namespace}, vm)
 		if err != nil {
 			return item, nil, "", nil, fmt.Errorf("failed to get VM %s: %w", vmName, err)
 		}
