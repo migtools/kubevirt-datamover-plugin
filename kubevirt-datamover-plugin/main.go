@@ -45,7 +45,7 @@ func newVMBackupPlugin(logger logrus.FieldLogger) (interface{}, error) {
 
 // newPVCBackupPlugin creates a new PVC BackupItemAction plugin.
 func newPVCBackupPlugin(logger logrus.FieldLogger) (interface{}, error) {
-	return pvc.NewBackupPlugin(logger), nil
+	return pvc.NewBackupPlugin(logger, nil)
 }
 
 // newVMDeletePlugin creates a new VirtualMachine DeleteItemAction plugin.

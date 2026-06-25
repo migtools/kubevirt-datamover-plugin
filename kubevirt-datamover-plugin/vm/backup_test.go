@@ -490,7 +490,7 @@ func TestBackupPlugin_checkPreconditions(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			vh, err := plugin.getOrCreateVolumeHelper(tc.backup, getFakeClient())
+			vh, err := plugin.pluginPVCPodCache.GetOrCreateVolumeHelper(tc.backup, getFakeClient(), plugin.Log)
 			require.NoError(t, err)
 			eligible, reason, err := CheckPreconditions(tc.vm, tc.backup, plugin.Log, vh)
 			require.NoError(t, err)
