@@ -306,7 +306,6 @@ func createTestPV(name string, pvc *corev1.PersistentVolumeClaim) *corev1.Persis
 }
 func getFakeClient() crclient.Client {
 	scheme := runtime.NewScheme()
-	//_ = velerov2alpha1.AddToScheme(scheme)
 	_ = kvcore.AddToScheme(scheme)
 	builder := fake.NewClientBuilder().
 		WithScheme(scheme)
