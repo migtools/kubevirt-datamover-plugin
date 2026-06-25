@@ -140,7 +140,9 @@ version: v1
 volumePolicies:
 - conditions: {}
   action:
-    type: skip
+    type: custom
+    parameters:
+      datamover: kubevirt
 `
 	volumePolicyCM := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
