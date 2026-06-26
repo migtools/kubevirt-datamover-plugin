@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	kvcore "kubevirt.io/api/core/v1"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -49,7 +50,9 @@ func newTestLogger() logrus.FieldLogger {
 }
 
 func TestBackupPlugin_AppliesTo(t *testing.T) {
-	plugin := NewBackupPlugin(newTestLogger())
+	fakeClient := getFakeClient()
+	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	require.NoError(t, err)
 
 	selector, err := plugin.AppliesTo()
 
@@ -60,7 +63,9 @@ func TestBackupPlugin_AppliesTo(t *testing.T) {
 }
 
 func TestBackupPlugin_Name(t *testing.T) {
-	plugin := NewBackupPlugin(newTestLogger())
+	fakeClient := getFakeClient()
+	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	require.NoError(t, err)
 
 	name := plugin.Name()
 
@@ -68,19 +73,23 @@ func TestBackupPlugin_Name(t *testing.T) {
 }
 
 func TestBackupPlugin_Execute_NilBackup(t *testing.T) {
-	plugin := NewBackupPlugin(newTestLogger())
+	fakeClient := getFakeClient()
+	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	require.NoError(t, err)
 
 	pvc := createTestPVC(testNamespace, testPVCName)
 	item := pvcToUnstructured(t, pvc)
 
-	_, _, _, _, err := plugin.Execute(item, nil)
+	_, _, _, _, err = plugin.Execute(item, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "backup object is nil")
 }
 
 func TestBackupPlugin_Execute_PVCWithoutVM(t *testing.T) {
-	plugin := NewBackupPlugin(newTestLogger())
+	fakeClient := getFakeClient()
+	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	require.NoError(t, err)
 
 	// Setup fake client
 	scheme := runtime.NewScheme()
@@ -112,7 +121,7 @@ func TestBackupPlugin_Execute_PVCWithoutVM(t *testing.T) {
 }
 
 func TestBackupPlugin_Execute_PVCWithCbtVm(t *testing.T) {
-	plugin := NewBackupPlugin(newTestLogger())
+	//fakeClient := getFakeClient()
 
 	// This is a unit test that uses a fake client.
 	const vmName = "test-vm-for-pvc-backup"
@@ -131,7 +140,9 @@ version: v1
 volumePolicies:
 - conditions: {}
   action:
-    type: skip
+    type: custom
+    parameters:
+      datamover: kubevirt
 `
 	volumePolicyCM := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -148,12 +159,14 @@ volumePolicies:
 	require.NoError(t, kvcore.AddToScheme(scheme))
 	require.NoError(t, corev1.AddToScheme(scheme))
 
-	fakeCrClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(vm, pv, pvc, volumePolicyCM).Build()
+	var fakeCrClient crclient.Client = fake.NewClientBuilder().WithScheme(scheme).WithObjects(vm, pv, pvc, volumePolicyCM).Build()
 	clients.SetCRClient(fakeCrClient)
 	defer clients.SetCRClient(nil) // Cleanup
 
 	fakeCoreClientset := k8sfake.NewSimpleClientset(pvc, pv, volumePolicyCM)
 	clients.SetCoreClient(fakeCoreClientset.CoreV1())
+	plugin, err := NewBackupPlugin(newTestLogger(), &fakeCrClient)
+	require.NoError(t, err)
 	defer clients.SetCoreClient(nil)
 
 	// Setup for plugin execution
@@ -290,4 +303,12 @@ func createTestPV(name string, pvc *corev1.PersistentVolumeClaim) *corev1.Persis
 			Phase: corev1.VolumeBound,
 		},
 	}
+}
+func getFakeClient() crclient.Client {
+	scheme := runtime.NewScheme()
+	_ = kvcore.AddToScheme(scheme)
+	builder := fake.NewClientBuilder().
+		WithScheme(scheme)
+	fakeClient := builder.Build()
+	return fakeClient
 }

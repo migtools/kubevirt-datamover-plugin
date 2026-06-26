@@ -40,13 +40,25 @@ type BackupPlugin struct {
 	// map[namespace]->[map[vmVolumes]->[]vmName]
 	nsPVCs map[string]map[string][]string
 	lock  sync.Mutex
-	
+	pluginPVCPodCache vmplugin.PluginPVCPodCache
+	crClient crclient.Client
 }
 
 
 // NewBackupPlugin creates a new BackupPlugin instance.
-func NewBackupPlugin(log logrus.FieldLogger) *BackupPlugin {
-	return &BackupPlugin{Log: log}
+func NewBackupPlugin(log logrus.FieldLogger, client *crclient.Client) (*BackupPlugin, error) {
+	var crClient crclient.Client
+	var err error
+	if client != nil {
+		crClient = *client
+	} else {
+		crClient, err = clients.CRClient()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get controller-runtime client: %w", err)
+		}
+	}
+
+	return &BackupPlugin{Log: log, crClient: crClient}, nil
 }
 
 // Name returns the plugin name.
@@ -81,23 +93,24 @@ func (p *BackupPlugin) Execute(
 
 	p.Log.Infof("[pvc-backup] Processing PersistentVolumeClaim %s/%s", pvc.Namespace, pvc.Name)
 	// Get VMs for this volume, if any
-	crClient, err := clients.CRClient()
-	if err != nil {
-		return item, nil, "", nil, fmt.Errorf("failed to get controller-runtime client: %w", err)
-	}
-	pvcs, err := p.getPVCList(crClient, pvc.Namespace)
+	pvcs, err := p.getPVCList(p.crClient, pvc.Namespace)
 	if err != nil {
 		return item, nil, "", nil, fmt.Errorf("failed to get PVC list: %w", err)
 	}
 	kubevirtDMVM := ""
+	// Get or create the cached VolumeHelper for this backup
+	vh, err := p.pluginPVCPodCache.GetOrCreateVolumeHelper(backup, p.crClient, p.Log)
+	if err != nil {
+		return item, nil, "", nil, err
+	}
 	vmNames := pvcs[pvc.Name]
 	for _, vmName := range vmNames {
 		vm := new(kvcore.VirtualMachine)
-		err := crClient.Get(context.Background(), crclient.ObjectKey{Name: vmName, Namespace: pvc.Namespace}, vm)
+		err := p.crClient.Get(context.Background(), crclient.ObjectKey{Name: vmName, Namespace: pvc.Namespace}, vm)
 		if err != nil {
 			return item, nil, "", nil, fmt.Errorf("failed to get VM %s: %w", vmName, err)
 		}
-		eligible, _, err := vmplugin.CheckPreconditions(vm, backup, p.Log)
+		eligible, _, err := vmplugin.CheckPreconditions(vm, backup, p.Log, vh)
 		if err != nil {
 			return item, nil, "", nil, fmt.Errorf("failed to check preconditions: %w", err)
 		}
