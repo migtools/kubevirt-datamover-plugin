@@ -5,10 +5,10 @@ go 1.25.8
 require (
 	github.com/bombsimon/logrusr/v4 v4.1.0
 	github.com/google/uuid v1.6.0
-	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260629184030-78bd83bfd3ed
+	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260630224416-4097f9e9ddc3
 	github.com/sirupsen/logrus v1.9.4
 	github.com/stretchr/testify v1.11.1
-	github.com/vmware-tanzu/velero v1.15.0
+	github.com/vmware-tanzu/velero v1.18.2-rc.2
 	k8s.io/api v0.35.0
 	k8s.io/apimachinery v0.35.0
 	k8s.io/client-go v0.35.0
@@ -106,6 +106,8 @@ require (
 )
 
 // Use same velero fork as the controller for compatibility
-replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20260625184912-30af95b19e2d
+replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20260630214535-9f9d4dc4bf29
 
 replace github.com/kcp-dev/kcp/sdk v0.0.0-00010101000000-000000000000 => github.com/kcp-dev/kcp/sdk v0.27.1
+
+exclude github.com/kcp-dev/kcp/sdk v0.0.0-00010101000000-000000000000
