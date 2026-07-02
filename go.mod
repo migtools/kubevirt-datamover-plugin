@@ -5,7 +5,7 @@ go 1.25.8
 require (
 	github.com/bombsimon/logrusr/v4 v4.1.0
 	github.com/google/uuid v1.6.0
-	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260701220338-347909007cb4
+	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260702202333-0258f59b50f1
 	github.com/sirupsen/logrus v1.9.4
 	github.com/stretchr/testify v1.11.1
 	github.com/vmware-tanzu/velero v1.18.2-rc.2
