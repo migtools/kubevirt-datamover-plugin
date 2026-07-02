@@ -5,7 +5,7 @@ go 1.25.8
 require (
 	github.com/bombsimon/logrusr/v4 v4.1.0
 	github.com/google/uuid v1.6.0
-	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260630224416-4097f9e9ddc3
+	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260701220338-347909007cb4
 	github.com/sirupsen/logrus v1.9.4
 	github.com/stretchr/testify v1.11.1
 	github.com/vmware-tanzu/velero v1.18.2-rc.2
@@ -87,7 +87,7 @@ require (
 	golang.org/x/text v0.38.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	gomodules.xyz/jsonpatch/v2 v2.4.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260523011958-0a33c5d7ca68 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/grpc v1.81.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
@@ -106,7 +106,7 @@ require (
 )
 
 // Use same velero fork as the controller for compatibility
-replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20260630214535-9f9d4dc4bf29
+replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20260701234155-b7b4cdc9cc18
 
 replace github.com/kcp-dev/kcp/sdk v0.0.0-00010101000000-000000000000 => github.com/kcp-dev/kcp/sdk v0.27.1
 
