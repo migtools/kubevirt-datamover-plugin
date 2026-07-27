@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
@@ -37,6 +38,8 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/label"
 	"github.com/vmware-tanzu/velero/pkg/plugin/utils/volumehelper"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	podvolumeutil "github.com/vmware-tanzu/velero/pkg/util/podvolume"
+	vhutil "github.com/vmware-tanzu/velero/pkg/util/volumehelper"
 
 	kvcore "kubevirt.io/api/core/v1"
 
@@ -48,11 +51,32 @@ import (
 // that handles kubevirt incremental backup via DataUpload CRs.
 type BackupPlugin struct {
 	Log logrus.FieldLogger
+	pluginPVCPodCache PluginPVCPodCache
+	crClient crclient.Client
+}
+
+type PluginPVCPodCache struct {
+	pvcPodCache *podvolumeutil.PVCPodCache
+}
+
+var kubevirtCustomPolicy = map[string]any{
+	"datamover": "kubevirt",
 }
 
 // NewBackupPlugin creates a new BackupPlugin instance.
-func NewBackupPlugin(log logrus.FieldLogger) *BackupPlugin {
-	return &BackupPlugin{Log: log}
+func NewBackupPlugin(log logrus.FieldLogger, client *crclient.Client) (*BackupPlugin, error) {
+	var crClient crclient.Client
+	var err error
+	if client != nil {
+		crClient = *client
+	} else {
+		crClient, err = clients.CRClient()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get controller-runtime client: %w", err)
+		}
+	}
+	
+	return &BackupPlugin{Log: log, crClient: crClient}, nil
 }
 
 // Name returns the plugin name.
@@ -97,8 +121,14 @@ func (p *BackupPlugin) Execute(
 
 	p.Log.Infof("[vm-backup] Processing VirtualMachine %s/%s", vm.Namespace, vm.Name)
 
+	// Get or create the cached VolumeHelper for this backup
+	vh, err := p.pluginPVCPodCache.GetOrCreateVolumeHelper(backup, p.crClient, p.Log)
+	if err != nil {
+		return nil, nil, "", nil, err
+	}
+
 	// Check preconditions
-	eligible, reason, err := CheckPreconditions(vm, backup, p.Log)
+	eligible, reason, err := CheckPreconditions(vm, backup, p.Log, vh)
 	if err != nil {
 		return nil, nil, "", nil, fmt.Errorf("failed to check preconditions: %w", err)
 	}
@@ -116,7 +146,7 @@ func (p *BackupPlugin) Execute(
 	p.Log.Infof("[vm-backup] Generated operation ID: %s", operationID)
 
 	// Get the first PVC with skip volume policy for SourcePVC (kubevirt datamover trigger)
-	sourcePVC, err := p.getFirstKubevirtPVC(vm, backup)
+	sourcePVC, err := p.getFirstKubevirtPVC(vm, backup, vh)
 	if err != nil {
 		return nil, nil, "", nil, fmt.Errorf("failed to get source PVC: %w", err)
 	}
@@ -256,7 +286,7 @@ func (p *BackupPlugin) Cancel(operationID string, backup *velerov1.Backup) error
 
 // CheckPreconditions verifies that the VirtualMachine meets all requirements
 // for kubevirt datamover backup.
-func CheckPreconditions(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log logrus.FieldLogger) (bool, string, error) {
+func CheckPreconditions(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log logrus.FieldLogger, vh vhutil.VolumeHelper) (bool, string, error) {
 	// Check 1: SnapshotMoveData must be true
 	if backup.Spec.SnapshotMoveData == nil || !*backup.Spec.SnapshotMoveData {
 		return false, "backup.Spec.SnapshotMoveData is not enabled", nil
@@ -275,23 +305,21 @@ func CheckPreconditions(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log 
 	}
 
 	// Check 4: Volume policy check
-	// - At least one PVC must have "skip" action (triggers kubevirt datamover)
+	// - At least one PVC must have "custom" action with "datamover=kubevirt" parameter (triggers kubevirt datamover)
 	// - No PVC can have "snapshot" action (would conflict with kubevirt datamover)
-	// TODO(https://github.com/migtools/kubevirt-datamover-plugin/issues/4): Once upstream
-	// Velero changes are merged, update this to check for "custom" action type and inspect
-	// the action parameters map to verify it's for kubevirt.
-	hasKubevirtPolicy, hasConflictingPolicy, err := checkVolumePolicies(vm, backup, log)
+	hasKubevirtPolicy, hasConflictingPolicy, err := checkVolumePolicies(vm, backup, log, vh)
 	if err != nil {
 		return false, "", fmt.Errorf("failed to check volume policies: %w", err)
+	}
+
+	if !hasKubevirtPolicy {
+		return false, "no PVCs with custom kubevirt volume policy found for kubevirt datamover", nil
 	}
 
 	if hasConflictingPolicy {
 		return false, "VirtualMachine has PVCs with snapshot volume policy which conflicts with kubevirt datamover", nil
 	}
 
-	if !hasKubevirtPolicy {
-		return false, "no PVCs with skip volume policy found for kubevirt datamover", nil
-	}
 
 	return true, "", nil
 }
@@ -303,11 +331,7 @@ func CheckPreconditions(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log 
 //   - hasConflictingPolicy: true if any PVC has "snapshot" action (conflicts with kubevirt datamover)
 //   - error: if there was an error checking policies
 //
-// TODO(https://github.com/migtools/kubevirt-datamover-plugin/issues/4): Once upstream
-// Velero changes are merged, update hasKubevirtPolicy to check for "custom" action type
-// with kubevirt-specific parameter. For now, we assume kubevirt policy is true if there
-// are PVCs and none have snapshot policy.
-func checkVolumePolicies(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log logrus.FieldLogger) (bool, bool, error) {
+func checkVolumePolicies(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log logrus.FieldLogger, vh vhutil.VolumeHelper) (bool, bool, error) {
 	// Get all PVCs associated with this VM using controller common function
 	pvcNames := controllercommon.GetVolumesForVm(vm)
 	if len(pvcNames) == 0 {
@@ -315,11 +339,6 @@ func checkVolumePolicies(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log
 		return false, false, nil
 	}
 
-	// Get controller-runtime client for volumehelper
-	crClient, err := clients.CRClient()
-	if err != nil {
-		return false, false, fmt.Errorf("failed to get controller-runtime client: %w", err)
-	}
 
 	coreClient, err := clients.CoreClient()
 	if err != nil {
@@ -327,6 +346,7 @@ func checkVolumePolicies(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log
 	}
 
 	hasConflictingPolicy := false
+	hasKubevirtPolicy := false
 
 	for _, pvcName := range pvcNames {
 		// Get the PVC
@@ -349,12 +369,9 @@ func checkVolumePolicies(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log
 		pvcUnstructured := &unstructured.Unstructured{Object: pvcMap}
 
 		// Use Velero's volumehelper to check if this PVC has snapshot policy
-		shouldSnapshot, err := volumehelper.ShouldPerformSnapshotWithBackup(
+		shouldSnapshot, err := vh.ShouldPerformSnapshot(
 			pvcUnstructured,
 			kuberesource.PersistentVolumeClaims,
-			*backup,
-			crClient,
-			log,
 		)
 		if err != nil {
 			return false, false, fmt.Errorf("failed to check volume policy for PVC %s: %w", pvcName, err)
@@ -365,12 +382,23 @@ func checkVolumePolicies(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log
 			hasConflictingPolicy = true
 			log.Warnf("[vm-backup] PVC %s/%s has snapshot policy which conflicts with kubevirt datamover", vm.Namespace, pvcName)
 		}
-	}
 
-	// For now, assume kubevirt policy is true if we have PVCs
-	// TODO(https://github.com/migtools/kubevirt-datamover-plugin/issues/4): After upstream
-	// changes merge, check for "custom" action with kubevirt-specific parameter here.
-	hasKubevirtPolicy := true
+		// Use Velero's volumehelper to check if this PVC has snapshot policy
+		shouldUseKubevirtDm, err := vh.ShouldPerformCustomAction(
+			pvcUnstructured,
+			kuberesource.PersistentVolumeClaims,
+			kubevirtCustomPolicy,
+		)
+		if err != nil {
+			return false, false, fmt.Errorf("failed to check volume policy for PVC %s: %w", pvcName, err)
+		}
+
+		if shouldUseKubevirtDm {
+			// This PVC has custom kubevirt policy
+			hasKubevirtPolicy = true
+			log.Warnf("[vm-backup] PVC %s/%s has kubevirt custom policy for kubevirt datamover", vm.Namespace, pvcName)
+		}
+	}
 
 	return hasKubevirtPolicy, hasConflictingPolicy, nil
 }
@@ -385,7 +413,7 @@ func checkVolumePolicies(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log
 // Velero changes merge, update this to return the first PVC with "custom" action type
 // and kubevirt-specific parameter set. The volumehelper API will need to expose the
 // actual action type (not just shouldSnapshot boolean) for this check.
-func (p *BackupPlugin) getFirstKubevirtPVC(vm *kvcore.VirtualMachine, backup *velerov1.Backup) (*corev1.PersistentVolumeClaim, error) {
+func (p *BackupPlugin) getFirstKubevirtPVC(vm *kvcore.VirtualMachine, backup *velerov1.Backup, vh vhutil.VolumeHelper) (*corev1.PersistentVolumeClaim, error) {
 	pvcNames := controllercommon.GetVolumesForVm(vm)
 	if len(pvcNames) == 0 {
 		return nil, fmt.Errorf("no PVCs found for VirtualMachine %s/%s", vm.Namespace, vm.Name)
@@ -394,11 +422,6 @@ func (p *BackupPlugin) getFirstKubevirtPVC(vm *kvcore.VirtualMachine, backup *ve
 	coreClient, err := clients.CoreClient()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get core client: %w", err)
-	}
-
-	crClient, err := clients.CRClient()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get controller-runtime client: %w", err)
 	}
 
 	for _, pvcName := range pvcNames {
@@ -420,20 +443,18 @@ func (p *BackupPlugin) getFirstKubevirtPVC(vm *kvcore.VirtualMachine, backup *ve
 		}
 		pvcUnstructured := &unstructured.Unstructured{Object: pvcMap}
 
-		// Check if this PVC has snapshot policy
-		shouldSnapshot, err := volumehelper.ShouldPerformSnapshotWithBackup(
+		// Check if this PVC has custom kubevirt datamover policy
+		shouldUseKubevirtDm, err := vh.ShouldPerformCustomAction(
 			pvcUnstructured,
 			kuberesource.PersistentVolumeClaims,
-			*backup,
-			crClient,
-			p.Log,
+			kubevirtCustomPolicy,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to check volume policy for PVC %s: %w", pvcName, err)
 		}
 
-		// Return first PVC without snapshot policy
-		if !shouldSnapshot {
+		// Return first PVC matching kubevirt dm custom policy action
+		if shouldUseKubevirtDm {
 			return pvc, nil
 		}
 	}
@@ -588,6 +609,39 @@ func (p *BackupPlugin) getDataUploadByOperationID(operationID string, backup *ve
 	}
 
 	return nil, nil
+}
+
+// getOrCreateVolumeHelper returns a VolumeHelper with lazy per-namespace caching.
+// The VolumeHelper uses the pvcPodCache which is populated lazily as namespaces are encountered.
+// Callers should use ensurePVCPodCacheForNamespace before calling methods that need
+// PVC-to-Pod lookups for a specific namespace.
+// Since plugin instances are unique per backup (created via newPluginManager and
+// cleaned up via CleanupClients at backup completion), we can safely cache this.
+func (p *PluginPVCPodCache) GetOrCreateVolumeHelper(backup *velerov1.Backup, crClient crclient.Client, log logrus.FieldLogger) (vhutil.VolumeHelper, error) {
+	// Initialize the PVC-to-Pod cache if needed
+	if p.pvcPodCache == nil {
+		p.pvcPodCache = podvolumeutil.NewPVCPodCache()
+	}
+
+	// Return the VolumeHelper with our lazily-built cache
+	// The cache will be populated incrementally as namespaces are encountered
+	return p.getVolumeHelperWithCache(backup, crClient, log)
+}
+
+// getVolumeHelperWithCache creates a VolumeHelper using the pre-built PVC-to-Pod cache.
+// The cache should be ensured for the relevant namespace(s) before calling this.
+func (p *PluginPVCPodCache) getVolumeHelperWithCache(backup *velerov1.Backup, crClient crclient.Client, log logrus.FieldLogger) (vhutil.VolumeHelper, error) {
+	// Create VolumeHelper with our lazy-built cache
+	vh, err := volumehelper.NewVolumeHelperWithCache(
+		*backup,
+		crClient,
+		log,
+		p.pvcPodCache,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create VolumeHelper: %w", err)
+	}
+	return vh, nil
 }
 
 // updateDataUpload updates a DataUpload CR in the cluster.

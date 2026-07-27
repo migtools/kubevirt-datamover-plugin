@@ -25,6 +25,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
@@ -53,7 +55,9 @@ func boolPtr(b bool) *bool {
 }
 
 func TestBackupPlugin_AppliesTo(t *testing.T) {
-	plugin := NewBackupPlugin(newTestLogger())
+	fakeClient := getFakeClient()
+	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	require.NoError(t, err)
 
 	selector, err := plugin.AppliesTo()
 
@@ -64,7 +68,9 @@ func TestBackupPlugin_AppliesTo(t *testing.T) {
 }
 
 func TestBackupPlugin_Name(t *testing.T) {
-	plugin := NewBackupPlugin(newTestLogger())
+	fakeClient := getFakeClient()
+	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	require.NoError(t, err)
 
 	name := plugin.Name()
 
@@ -72,19 +78,23 @@ func TestBackupPlugin_Name(t *testing.T) {
 }
 
 func TestBackupPlugin_Execute_NilBackup(t *testing.T) {
-	plugin := NewBackupPlugin(newTestLogger())
+	fakeClient := getFakeClient()
+	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	require.NoError(t, err)
 
 	vm := createTestVM(testNamespace, testVMName, kvcore.VirtualMachineStatusRunning)
 	item := vmToUnstructured(t, vm)
 
-	_, _, _, _, err := plugin.Execute(item, nil)
+	_, _, _, _, err = plugin.Execute(item, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "backup object is nil")
 }
 
 func TestBackupPlugin_Execute_SnapshotMoveDataNotEnabled(t *testing.T) {
-	plugin := NewBackupPlugin(newTestLogger())
+	fakeClient := getFakeClient()
+	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	require.NoError(t, err)
 
 	vm := createTestVM(testNamespace, testVMName, kvcore.VirtualMachineStatusRunning)
 	item := vmToUnstructured(t, vm)
@@ -108,7 +118,9 @@ func TestBackupPlugin_Execute_SnapshotMoveDataNotEnabled(t *testing.T) {
 }
 
 func TestBackupPlugin_Execute_VMNotRunning(t *testing.T) {
-	plugin := NewBackupPlugin(newTestLogger())
+	fakeClient := getFakeClient()
+	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	require.NoError(t, err)
 
 	vm := createTestVM(testNamespace, testVMName, kvcore.VirtualMachineStatusStopped)
 	item := vmToUnstructured(t, vm)
@@ -410,7 +422,9 @@ func TestControllerGetVolumesForVm(t *testing.T) {
 }
 
 func TestBackupPlugin_checkPreconditions(t *testing.T) {
-	plugin := NewBackupPlugin(newTestLogger())
+	fakeClient := getFakeClient()
+	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	require.NoError(t, err)
 
 	testCases := []struct {
 		name             string
@@ -476,7 +490,9 @@ func TestBackupPlugin_checkPreconditions(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			eligible, reason, err := CheckPreconditions(tc.vm, tc.backup, plugin.Log)
+			vh, err := plugin.pluginPVCPodCache.GetOrCreateVolumeHelper(tc.backup, plugin.crClient, plugin.Log)
+			require.NoError(t, err)
+			eligible, reason, err := CheckPreconditions(tc.vm, tc.backup, plugin.Log, vh)
 			require.NoError(t, err)
 			assert.Equal(t, tc.expectedEligible, eligible)
 			if !tc.expectedEligible {
@@ -486,6 +502,15 @@ func TestBackupPlugin_checkPreconditions(t *testing.T) {
 	}
 }
 
+func getFakeClient() crclient.Client {
+	scheme := runtime.NewScheme()
+	//_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kvcore.AddToScheme(scheme)
+	builder := fake.NewClientBuilder().
+		WithScheme(scheme)
+	fakeClient := builder.Build()
+	return fakeClient
+}
 func TestGenerateOperationID(t *testing.T) {
 	operationID := generateOperationID("backup-1", "namespace-1", "vm-1")
 
