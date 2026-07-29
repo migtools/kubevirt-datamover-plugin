@@ -7,6 +7,7 @@ import (
 
 	"github.com/bombsimon/logrusr/v4"
 	//"github.com/go-logr/logr"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 	"github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/clients"
 	"github.com/sirupsen/logrus"
@@ -19,10 +20,10 @@ import (
 
 type DeletePlugin struct {
 	Log                logrus.FieldLogger
-	ObjectStoreFactory func(c *uploader.UploaderConfig) (velero.ObjectStore, error)
+	ObjectStoreFactory func(c *common.ObjectStoreConfig) (velero.ObjectStore, error)
 }
 
-func NewDeletePlugin(log logrus.FieldLogger, factory func(c *uploader.UploaderConfig) (velero.ObjectStore, error)) *DeletePlugin {
+func NewDeletePlugin(log logrus.FieldLogger, factory func(c *common.ObjectStoreConfig) (velero.ObjectStore, error)) *DeletePlugin {
 	return &DeletePlugin{Log: log, ObjectStoreFactory: factory}
 }
 
