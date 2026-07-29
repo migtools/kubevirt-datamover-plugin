@@ -3,6 +3,7 @@ package vm
 import (
 	"testing"
 
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 	"github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/clients"
 	"github.com/stretchr/testify/assert"
@@ -73,7 +74,7 @@ func TestDeletePlugin_Execute(t *testing.T) {
 	// Also store the qcow2 file so chain validation succeeds
 	//qcow2Path := "checkpoints/" + vmNamespace + "/" + vmName + "/" + existingCheckpointID + "/vmb-prev-disk1.qcow2"
 	//_ = mockStore.PutObject("test-bucket", qcow2Path, bytes.NewReader([]byte("fake-qcow2-data")))
-	testObjectStoreFactory := func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+	testObjectStoreFactory := func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 		return mockStore, nil
 	}
 	fakeClientBuilder = fakeClientBuilder.WithScheme(scheme)
