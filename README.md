@@ -54,12 +54,29 @@ Handles VirtualMachine resources during backup:
 - Adds `DataUploadNameAnnotation` to the VirtualMachine
 - Returns an async operation ID for progress tracking
 
-### VirtualMachine RestoreItemAction
+### PersistentVolumeClaim BackupItemAction
 
-Handles VirtualMachine resources during restore:
+Handles PersistentVolumeClaim resources during backup:
 
-- Creates `DataDownload` CR based on backup annotations
-- Coordinates with the KubeVirt Datamover Controller for qcow2-to-raw conversion
+- Determines whether a PVC belongs to a VM that is eligible for kubevirt
+  datamover (same preconditions as the VirtualMachine BackupItemAction)
+- Stamps the `AnnotationVMName` annotation on the PVC so the restore-side
+  PersistentVolumeClaim RestoreItemAction can recognize it later
+- Does not create any CR itself — the VM BackupItemAction owns `DataUpload`
+  creation
+
+### PersistentVolumeClaim RestoreItemAction
+
+Handles PersistentVolumeClaim resources during restore:
+
+- Recognizes PVCs backed up via the kubevirt datamover, using the `AnnotationVMName`
+  annotation stamped on the PVC by the PVC BackupItemAction
+- Creates a `DataDownload` CR with `Spec.DataMover: "kubevirt"` to trigger the
+  KubeVirt Datamover Controller's restore path (qcow2-to-raw conversion)
+- Returns an async operation ID for progress tracking, mirroring the backup-side
+  DataUpload flow
+- Operates at the PVC level (not VM level), so multi-disk VMs are handled
+  naturally: one `DataDownload` per PVC, no special-casing required
 
 ### VirtualMachineBackup/VirtualMachineBackupTracker RestoreItemAction
 

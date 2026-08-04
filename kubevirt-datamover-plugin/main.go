@@ -20,6 +20,7 @@ import (
 
 	"github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/pvc"
 	"github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/vm"
+	"github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/vmbackup"
 )
 
 func main() {
@@ -31,6 +32,14 @@ func main() {
 		RegisterBackupItemActionV2("kubevirt.io/01-vm-datamover-backup-plugin", newVMBackupPlugin).
 		RegisterBackupItemActionV2("kubevirt.io/02-pvc-datamover-backup-plugin", newPVCBackupPlugin).
 		RegisterDeleteItemAction("kubevirt.io/01-vm-datamover-delete-plugin", newVMDeletePlugin).
+		// PersistentVolumeClaim RestoreItemAction for kubevirt datamover.
+		// Recognizes PVCs tagged by the PVC BackupItemAction (AnnotationVMName) and
+		// creates DataDownload CRs to trigger the kubevirt datamover controller's
+		// restore path, tracking progress via the async operation ID mechanism.
+		RegisterRestoreItemActionV2("kubevirt.io/03-pvc-datamover-restore-plugin", newPVCRestorePlugin).
+		// VirtualMachineBackup/VirtualMachineBackupTracker RestoreItemAction.
+		// Discards these backup-time-only bookkeeping CRs on restore.
+		RegisterRestoreItemAction("kubevirt.io/04-vmbackup-discard-plugin", newVMBackupDiscardPlugin).
 		Serve()
 }
 
@@ -51,4 +60,19 @@ func newPVCBackupPlugin(logger logrus.FieldLogger) (interface{}, error) {
 // newVMDeletePlugin creates a new VirtualMachine DeleteItemAction plugin.
 func newVMDeletePlugin(logger logrus.FieldLogger) (interface{}, error) {
 	return vm.NewDeletePlugin(logger, nil), nil
+}
+
+// newPVCRestorePlugin creates a new PersistentVolumeClaim RestoreItemAction plugin.
+// This plugin is responsible for:
+// - Recognizing PVCs backed up via the kubevirt datamover (AnnotationVMName annotation)
+// - Creating DataDownload CRs to trigger the kubevirt datamover controller's restore path
+// - Tracking async operation progress via the DataDownload status
+func newPVCRestorePlugin(logger logrus.FieldLogger) (interface{}, error) {
+	return pvc.NewRestorePlugin(logger, nil)
+}
+
+// newVMBackupDiscardPlugin creates a new VirtualMachineBackup/VirtualMachineBackupTracker
+// RestoreItemAction plugin that discards these backup-time-only bookkeeping CRs on restore.
+func newVMBackupDiscardPlugin(logger logrus.FieldLogger) (interface{}, error) {
+	return vmbackup.NewDiscardPlugin(logger), nil
 }

@@ -15,6 +15,8 @@
 package vm
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
 	"github.com/sirupsen/logrus"
@@ -25,15 +27,21 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/rest"
+	k8stesting "k8s.io/client-go/testing"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
 
 	kvcore "kubevirt.io/api/core/v1"
 
 	controllercommon "github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	"github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/clients"
 )
 
 const (
@@ -511,6 +519,247 @@ func getFakeClient() crclient.Client {
 	fakeClient := builder.Build()
 	return fakeClient
 }
+
+// newDataUploadDynamicClient returns a fake dynamic client seeded with objects,
+// scoped to the velerov2alpha1 scheme so DataUpload GVK operations resolve.
+func newDataUploadDynamicClient(t *testing.T, objects ...runtime.Object) *dynamicfake.FakeDynamicClient {
+	scheme := runtime.NewScheme()
+	require.NoError(t, velerov2alpha1.AddToScheme(scheme))
+	return dynamicfake.NewSimpleDynamicClient(scheme, objects...)
+}
+
+// withFakeDynamicClient overrides the package-level getDynamicClient and the
+// clients package's in-cluster config for the duration of t, restoring both
+// via t.Cleanup. Because it mutates package-level state, tests using it must
+// not run with t.Parallel().
+func withFakeDynamicClient(t *testing.T, fakeDynamic *dynamicfake.FakeDynamicClient) {
+	t.Helper()
+	original := getDynamicClient
+	SetDynamicClientFunc(func(config interface{}) (dynamicClientInterface, error) {
+		return fakeDynamic, nil
+	})
+	t.Cleanup(func() { getDynamicClient = original })
+
+	clients.SetInClusterConfig(&rest.Config{Host: "https://fake"})
+	t.Cleanup(func() { clients.SetInClusterConfig(nil) })
+}
+
+func dataUploadUnstructured(t *testing.T, du *velerov2alpha1.DataUpload) *unstructured.Unstructured {
+	duMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(du)
+	require.NoError(t, err)
+	u := &unstructured.Unstructured{Object: duMap}
+	u.SetGroupVersionKind(schema.GroupVersionKind{Group: "velero.io", Version: "v2alpha1", Kind: "DataUpload"})
+	return u
+}
+
+func TestBackupPlugin_CreateDataUpload_AlreadyExists_Reuse(t *testing.T) {
+	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
+
+	// Precompute the exact name/operationID createDataUpload will derive, and
+	// seed the fake dynamic client with a matching DataUpload already present --
+	// this simulates a prior Execute() call for this same (backup, VM) having
+	// already created it (e.g. Velero retried after a transient RPC error).
+	operationID := generateOperationID(backup.Name, vm.Namespace, vm.Name)
+	existingName := generateDataUploadName(backup.Name, vm.Name)
+
+	existing := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      existingName,
+			Namespace: backup.Namespace,
+			Labels: map[string]string{
+				velerov1.BackupNameLabel: controllercommon.SafeLabelValue(backup.Name),
+			},
+			Annotations: map[string]string{
+				controllercommon.AnnotationVMName:      vm.Name,
+				controllercommon.AnnotationVMNamespace: vm.Namespace,
+				controllercommon.AnnotationOperationID: operationID,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			SourcePVC: sourcePVC.Name,
+		},
+	}
+
+	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, existing))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	result, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
+
+	require.NoError(t, err, "createDataUpload must reuse the existing DataUpload instead of erroring on AlreadyExists")
+	assert.Equal(t, existingName, result.Name)
+	assert.Equal(t, operationID, result.Annotations[controllercommon.AnnotationOperationID])
+
+	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
+	list, err := fakeDynamic.Resource(gvr).Namespace(backup.Namespace).List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	assert.Len(t, list.Items, 1, "createDataUpload must not create a duplicate DataUpload for a retried call")
+}
+
+func TestBackupPlugin_CreateDataUpload_AlreadyExists_Mismatch(t *testing.T) {
+	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
+
+	operationID := generateOperationID(backup.Name, vm.Namespace, vm.Name)
+	existingName := generateDataUploadName(backup.Name, vm.Name)
+
+	// Same deterministic name, but a different SourcePVC -- must not be mistaken
+	// for "our" operation and silently reused.
+	existing := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      existingName,
+			Namespace: backup.Namespace,
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			SourcePVC: "some-other-pvc",
+		},
+	}
+
+	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, existing))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	_, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refusing to reuse")
+}
+
+func TestBackupPlugin_Cancel(t *testing.T) {
+	const operationID = "op-cancel-1"
+	backup := &velerov1.Backup{ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"}}
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "du-cancel",
+			Namespace: backup.Namespace,
+			Labels: map[string]string{
+				velerov1.BackupNameLabel: controllercommon.SafeLabelValue(backup.Name),
+			},
+			Annotations: map[string]string{
+				controllercommon.AnnotationOperationID: operationID,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{Cancel: false},
+	}
+
+	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, du))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	err := plugin.Cancel(operationID, backup)
+	require.NoError(t, err)
+
+	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
+	updated, err := fakeDynamic.Resource(gvr).Namespace(backup.Namespace).Get(context.Background(), "du-cancel", metav1.GetOptions{})
+	require.NoError(t, err)
+	updatedDU := &velerov2alpha1.DataUpload{}
+	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(updated.Object, updatedDU))
+	assert.True(t, updatedDU.Spec.Cancel)
+}
+
+func TestBackupPlugin_Cancel_RetriesTransientPatchFailure(t *testing.T) {
+	const operationID = "op-cancel-retry-1"
+	backup := &velerov1.Backup{ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"}}
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "du-cancel-retry",
+			Namespace: backup.Namespace,
+			Labels: map[string]string{
+				velerov1.BackupNameLabel: controllercommon.SafeLabelValue(backup.Name),
+			},
+			Annotations: map[string]string{
+				controllercommon.AnnotationOperationID: operationID,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{Cancel: false},
+	}
+
+	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, du))
+	attempts := 0
+	fakeDynamic.PrependReactor("patch", "datauploads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		attempts++
+		if attempts < 3 {
+			return true, nil, fmt.Errorf("simulated transient patch failure")
+		}
+		// Unhandled: let the request fall through to the tracker's default
+		// reactor, which actually applies the patch.
+		return false, nil, nil
+	})
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	err := plugin.Cancel(operationID, backup)
+
+	require.NoError(t, err, "Cancel must retry past transient patch failures rather than giving up after one attempt -- Velero's own timeout enforcement calls Cancel exactly once and discards the error, so this is the only retry path that exists")
+	assert.Equal(t, 3, attempts)
+
+	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
+	updated, err := fakeDynamic.Resource(gvr).Namespace(backup.Namespace).Get(context.Background(), "du-cancel-retry", metav1.GetOptions{})
+	require.NoError(t, err)
+	updatedDU := &velerov2alpha1.DataUpload{}
+	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(updated.Object, updatedDU))
+	assert.True(t, updatedDU.Spec.Cancel)
+}
+
+func TestBackupPlugin_Cancel_PatchFails(t *testing.T) {
+	const operationID = "op-cancel-fail-1"
+	backup := &velerov1.Backup{ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"}}
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "du-cancel-fail",
+			Namespace: backup.Namespace,
+			Labels: map[string]string{
+				velerov1.BackupNameLabel: controllercommon.SafeLabelValue(backup.Name),
+			},
+			Annotations: map[string]string{
+				controllercommon.AnnotationOperationID: operationID,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{Cancel: false},
+	}
+
+	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, du))
+	fakeDynamic.PrependReactor("patch", "datauploads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("simulated patch failure")
+	})
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	err := plugin.Cancel(operationID, backup)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to update DataUpload for cancellation")
+}
+
+func TestBackupPlugin_Cancel_NotFound(t *testing.T) {
+	backup := &velerov1.Backup{ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"}}
+
+	fakeDynamic := newDataUploadDynamicClient(t)
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	err := plugin.Cancel("missing-op", backup)
+	assert.NoError(t, err)
+}
+
 func TestGenerateOperationID(t *testing.T) {
 	operationID := generateOperationID("backup-1", "namespace-1", "vm-1")
 
@@ -519,9 +768,14 @@ func TestGenerateOperationID(t *testing.T) {
 	assert.Contains(t, operationID, "namespace-1")
 	assert.Contains(t, operationID, "vm-1")
 
-	// Verify uniqueness
+	// Deterministic by design (see deterministicSuffix doc comment): a retried
+	// Execute() call for the same (backup, namespace, vm) must converge on the
+	// same operation ID so it can find the DataUpload it already created.
 	operationID2 := generateOperationID("backup-1", "namespace-1", "vm-1")
-	assert.NotEqual(t, operationID, operationID2)
+	assert.Equal(t, operationID, operationID2, "same inputs must produce the same operation ID")
+
+	operationID3 := generateOperationID("backup-2", "namespace-1", "vm-1")
+	assert.NotEqual(t, operationID, operationID3, "different inputs must produce a different operation ID")
 }
 
 func TestGenerateDataUploadName(t *testing.T) {
