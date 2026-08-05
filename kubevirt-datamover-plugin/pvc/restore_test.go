@@ -246,8 +246,21 @@ func TestRestorePlugin_Execute_Eligible(t *testing.T) {
 			// doc comment on Execute). If the code mistakenly read from Item
 			// instead, this PVC would be treated as ineligible and this test would
 			// fail with an empty OperationID.
-			item := restorePVCToUnstructured(t, newRestorePVC(testOrigNamespace, testRestorePVCName, nil))
-			expectedItem := item.DeepCopyObject().(runtime.Unstructured)
+			//
+			// Item also carries VolumeName/Status as the backed-up PVC would have
+			// (already bound to its pre-backup PV) -- Execute must clear both, or
+			// the datamover controller rejects the restored PVC as already bound.
+			itemPVC := newRestorePVC(testOrigNamespace, testRestorePVCName, nil)
+			itemPVC.Spec.VolumeName = "pvc-original-pv"
+			itemPVC.Status = corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound}
+			item := restorePVCToUnstructured(t, itemPVC)
+			originalItem := item.DeepCopyObject().(runtime.Unstructured)
+
+			expectedUpdatedPVC := itemPVC.DeepCopy()
+			expectedUpdatedPVC.Spec.VolumeName = ""
+			expectedUpdatedPVC.Status = corev1.PersistentVolumeClaimStatus{}
+			expectedUpdatedItem := restorePVCToUnstructured(t, expectedUpdatedPVC)
+
 			restore := &velerov1.Restore{
 				ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS, UID: "restore-uid"},
 				Spec: velerov1.RestoreSpec{
@@ -265,8 +278,9 @@ func TestRestorePlugin_Execute_Eligible(t *testing.T) {
 
 			require.NoError(t, err)
 			require.NotNil(t, output)
-			assert.Equal(t, expectedItem, output.UpdatedItem, "Execute must return input.Item unmodified, not ItemFromBackup")
-			assert.Equal(t, expectedItem, item, "Execute must not mutate the passed-in Item")
+			assert.Equal(t, expectedUpdatedItem, output.UpdatedItem,
+				"Execute must clear Spec.VolumeName/Status on the returned item so the datamover controller can rebind a new PV")
+			assert.Equal(t, originalItem, item, "Execute must not mutate the passed-in Item")
 			assert.NotEmpty(t, output.OperationID)
 			assert.Empty(t, output.AdditionalItems, "DataDownload is created live, not sourced from the backup archive, so it must not be an AdditionalItem")
 
