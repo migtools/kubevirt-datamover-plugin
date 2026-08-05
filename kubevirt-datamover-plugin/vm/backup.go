@@ -53,6 +53,10 @@ import (
 	"github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/clients"
 )
 
+// apiCallTimeout bounds each individual Kubernetes API call made by this
+// plugin so a stuck API server can't hang a Velero backup indefinitely.
+const apiCallTimeout = 30 * time.Second
+
 // BackupPlugin is a BackupItemAction plugin for VirtualMachine resources
 // that handles kubevirt incremental backup via DataUpload CRs.
 type BackupPlugin struct {
@@ -758,8 +762,10 @@ func (p *BackupPlugin) updateDataUpload(du *velerov2alpha1.DataUpload) error {
 		// errors that are plausibly transient (server hiccup, timeout, etc).
 		return !apierrors.IsNotFound(err) && !apierrors.IsInvalid(err)
 	}, func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
+		defer cancel()
 		_, patchErr := dynamicClient.Resource(gvr).Namespace(du.Namespace).Patch(
-			context.Background(),
+			ctx,
 			du.Name,
 			types.MergePatchType,
 			patch,

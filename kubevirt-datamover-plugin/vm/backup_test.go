@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
@@ -28,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
@@ -544,6 +546,17 @@ func withFakeDynamicClient(t *testing.T, fakeDynamic *dynamicfake.FakeDynamicCli
 	t.Cleanup(func() { clients.SetInClusterConfig(nil) })
 }
 
+// withFastCancelBackoff overrides the package-level cancelPatchBackoff with a
+// minimal backoff for the duration of t, restoring the original via
+// t.Cleanup. Used by Cancel retry tests so they don't pay the real ~600ms of
+// sleep the production backoff (200ms, factor 2, 3 steps) would incur.
+func withFastCancelBackoff(t *testing.T) {
+	t.Helper()
+	original := cancelPatchBackoff
+	cancelPatchBackoff = wait.Backoff{Steps: 3, Duration: time.Millisecond, Factor: 1.0}
+	t.Cleanup(func() { cancelPatchBackoff = original })
+}
+
 func dataUploadUnstructured(t *testing.T, du *velerov2alpha1.DataUpload) *unstructured.Unstructured {
 	duMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(du)
 	require.NoError(t, err)
@@ -671,6 +684,8 @@ func TestBackupPlugin_Cancel(t *testing.T) {
 }
 
 func TestBackupPlugin_Cancel_RetriesTransientPatchFailure(t *testing.T) {
+	withFastCancelBackoff(t)
+
 	const operationID = "op-cancel-retry-1"
 	backup := &velerov1.Backup{ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"}}
 
@@ -717,6 +732,8 @@ func TestBackupPlugin_Cancel_RetriesTransientPatchFailure(t *testing.T) {
 }
 
 func TestBackupPlugin_Cancel_PatchFails(t *testing.T) {
+	withFastCancelBackoff(t)
+
 	const operationID = "op-cancel-fail-1"
 	backup := &velerov1.Backup{ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"}}
 
