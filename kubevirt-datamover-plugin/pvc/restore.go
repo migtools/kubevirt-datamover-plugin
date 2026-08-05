@@ -423,6 +423,21 @@ func (p *RestorePlugin) createDataDownload(
 			return nil, fmt.Errorf("existing DataDownload %s/%s has no %s annotation; refusing to reuse it since progress and cancellation could not track it",
 				restore.Namespace, dataDownloadName, controllercommon.AnnotationOperationID)
 		}
+		// getDataDownloadByOperationID narrows server-side with these three
+		// labels before its annotation re-check, so a missing or divergent
+		// label would make the object unfindable even though the annotation
+		// above matches.
+		wantLabels := map[string]string{
+			controllercommon.LabelVeleroBackupName:  controllercommon.SafeLabelValue(restore.Spec.BackupName),
+			controllercommon.LabelVeleroRestoreName: controllercommon.SafeLabelValue(restore.Name),
+			controllercommon.AnnotationOperationID:  controllercommon.SafeLabelValue(existing.Annotations[controllercommon.AnnotationOperationID]),
+		}
+		for key, want := range wantLabels {
+			if existing.Labels[key] != want {
+				return nil, fmt.Errorf("existing DataDownload %s/%s has label %s=%q, expected %q; refusing to reuse it since progress and cancellation could not find it",
+					restore.Namespace, dataDownloadName, key, existing.Labels[key], want)
+			}
+		}
 		p.Log.Infof("[pvc-restore] DataDownload %s/%s already exists for this restore+PVC, reusing it instead of creating a duplicate",
 			restore.Namespace, dataDownloadName)
 		return existing, nil

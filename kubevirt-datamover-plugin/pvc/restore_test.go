@@ -622,6 +622,70 @@ func TestRestorePlugin_Execute_AlreadyExists_MissingOperationIDAnnotation(t *tes
 	assert.Contains(t, err.Error(), controllercommon.AnnotationOperationID)
 }
 
+func TestRestorePlugin_Execute_AlreadyExists_MissingOperationIDLabel(t *testing.T) {
+	const pvcName = testRestorePVCName
+	const existingOperationID = "some-operation-id"
+
+	existingName := generateDataDownloadName(testRestoreName, testOrigNamespace, pvcName)
+
+	// The operationID annotation is present (so the annotation-missing check
+	// passes), but the corresponding label is not. getDataDownloadByOperationID
+	// filters server-side via a label selector (backup name, restore name, and
+	// operationID) before it ever inspects annotations -- an object missing any
+	// of those labels would never be returned by that List call, so Progress and
+	// Cancel could never find it even though the annotation matches.
+	existing := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      existingName,
+			Namespace: testVeleroNS,
+			Labels: map[string]string{
+				controllercommon.LabelVeleroBackupName:  controllercommon.SafeLabelValue(testOrigBackupName),
+				controllercommon.LabelVeleroRestoreName: controllercommon.SafeLabelValue(testRestoreName),
+				// AnnotationOperationID label deliberately omitted.
+			},
+			Annotations: map[string]string{
+				controllercommon.AnnotationOperationID: existingOperationID,
+			},
+		},
+		Spec: velerov2alpha1.DataDownloadSpec{
+			TargetVolume: velerov2alpha1.TargetVolumeSpec{
+				PVC:       pvcName,
+				Namespace: testOrigNamespace,
+			},
+		},
+	}
+
+	fakeDynamic := newDataDownloadDynamicClient(t, dataDownloadUnstructured(t, existing))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testOrigBackupName, Namespace: testVeleroNS},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	fakeCRClient := getFakeCRClient(t, backup)
+	plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+	require.NoError(t, err)
+
+	pvc := newRestorePVC(testOrigNamespace, pvcName, map[string]string{
+		controllercommon.AnnotationVMName: "my-vm",
+	})
+	pvcItem := restorePVCToUnstructured(t, pvc)
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS},
+		Spec:       velerov1.RestoreSpec{BackupName: testOrigBackupName},
+	}
+
+	_, err = plugin.Execute(&velero.RestoreItemActionExecuteInput{
+		Item:           pvcItem,
+		ItemFromBackup: pvcItem,
+		Restore:        restore,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refusing to reuse")
+	assert.Contains(t, err.Error(), controllercommon.AnnotationOperationID)
+}
+
 // countingCRClient wraps a crclient.Client and counts Get calls, used to prove
 // RestorePlugin.getBackup caches the Backup instead of re-fetching it per PVC.
 type countingCRClient struct {
