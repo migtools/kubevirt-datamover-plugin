@@ -187,29 +187,34 @@ func (p *RestorePlugin) Execute(input *velero.RestoreItemActionExecuteInput) (*v
 }
 
 // clearPVCBinding returns a copy of item with the binding-implying fields
-// cleared. The backed-up PVC was already bound to its pre-backup PV, but that
-// PV is not restored by this flow -- the datamover controller rebinds a new
-// scratch PV onto this PVC once the DataDownload completes. Leaving
-// Spec.VolumeName/Status.Phase intact would make Velero create the restored
-// PVC still carrying that stale binding, which the datamover controller's
+// removed. The backed-up PVC was already bound to its pre-backup PV, but
+// that PV is not restored by this flow -- the datamover controller rebinds
+// a new scratch PV onto this PVC once the DataDownload completes. Leaving
+// spec.volumeName/status intact would make Velero create the restored PVC
+// still carrying that stale binding, which the datamover controller's
 // handleAccepted rejects outright ("already bound or requests volume ...,
 // which conflicts with restore rebinding") since it can never safely rebind
 // an already-bound PVC. Velero's own built-in CSI PVC restore action clears
 // the same fields for the analogous reason.
+//
+// This operates on the raw unstructured content (via RemoveNestedField)
+// rather than round-tripping through a typed corev1.PersistentVolumeClaim:
+// a typed round-trip would silently drop any field the vendored corev1
+// type doesn't know about (e.g. a newer field from a cluster running a
+// later Kubernetes version than this plugin was built against), whereas
+// removing just the two fields that actually need clearing preserves
+// everything else exactly as Velero handed it to us.
 func clearPVCBinding(item runtime.Unstructured) (runtime.Unstructured, error) {
-	pvc := &corev1.PersistentVolumeClaim{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(item.UnstructuredContent(), pvc); err != nil {
-		return nil, fmt.Errorf("failed to convert item to PersistentVolumeClaim: %w", err)
+	copied := item.DeepCopyObject()
+	cleaned, ok := copied.(runtime.Unstructured)
+	if !ok {
+		return nil, fmt.Errorf("failed to copy restore item: unexpected type %T", copied)
 	}
 
-	pvc.Spec.VolumeName = ""
-	pvc.Status = corev1.PersistentVolumeClaimStatus{}
+	unstructured.RemoveNestedField(cleaned.UnstructuredContent(), "spec", "volumeName")
+	unstructured.RemoveNestedField(cleaned.UnstructuredContent(), "status")
 
-	pvcMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pvc)
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert PersistentVolumeClaim to unstructured: %w", err)
-	}
-	return &unstructured.Unstructured{Object: pvcMap}, nil
+	return cleaned, nil
 }
 
 // Progress returns the progress of an async restore operation.
