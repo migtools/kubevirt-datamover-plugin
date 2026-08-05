@@ -278,8 +278,8 @@ func TestRestorePlugin_Execute_Eligible(t *testing.T) {
 			dd := &velerov2alpha1.DataDownload{}
 			require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(created.Object, dd))
 
-			assert.True(t, strings.HasPrefix(dd.Name, fmt.Sprintf("dd-%s-%s-%s-", testRestoreName, tc.expectedTargetNS, testRestorePVCName)),
-				"DataDownload name must be derived from the restore name, target namespace, and PVC name via generateDataDownloadName, got %q", dd.Name)
+			assert.True(t, strings.HasPrefix(dd.Name, fmt.Sprintf("dd-%s-%s-%s-", testRestoreName, testOrigNamespace, testRestorePVCName)),
+				"DataDownload name must be derived from the restore name, original namespace, and PVC name via generateDataDownloadName, got %q", dd.Name)
 			assert.Equal(t, controllercommon.SafeLabelValue(testOrigBackupName), dd.Labels[controllercommon.LabelVeleroBackupName])
 			assert.Equal(t, controllercommon.SafeLabelValue(testRestoreName), dd.Labels[controllercommon.LabelVeleroRestoreName])
 			assert.Equal(t, "my-vm", dd.Annotations[controllercommon.AnnotationVMName])
@@ -567,6 +567,56 @@ func TestRestorePlugin_Execute_AlreadyExists_Mismatch(t *testing.T) {
 	assert.Contains(t, err.Error(), "refusing to reuse")
 }
 
+func TestRestorePlugin_Execute_AlreadyExists_NamespaceMismatch(t *testing.T) {
+	const pvcName = testRestorePVCName
+
+	existingName := generateDataDownloadName(testRestoreName, testOrigNamespace, pvcName)
+
+	// Same deterministic name and same PVC name, but a different TargetVolume
+	// namespace -- must not be mistaken for "our" operation and silently reused.
+	existing := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      existingName,
+			Namespace: testVeleroNS,
+		},
+		Spec: velerov2alpha1.DataDownloadSpec{
+			TargetVolume: velerov2alpha1.TargetVolumeSpec{
+				PVC:       pvcName,
+				Namespace: "some-other-ns",
+			},
+		},
+	}
+
+	fakeDynamic := newDataDownloadDynamicClient(t, dataDownloadUnstructured(t, existing))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testOrigBackupName, Namespace: testVeleroNS},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	fakeCRClient := getFakeCRClient(t, backup)
+	plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+	require.NoError(t, err)
+
+	pvc := newRestorePVC(testOrigNamespace, pvcName, map[string]string{
+		controllercommon.AnnotationVMName: "my-vm",
+	})
+	pvcItem := restorePVCToUnstructured(t, pvc)
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS},
+		Spec:       velerov1.RestoreSpec{BackupName: testOrigBackupName},
+	}
+
+	_, err = plugin.Execute(&velero.RestoreItemActionExecuteInput{
+		Item:           pvcItem,
+		ItemFromBackup: pvcItem,
+		Restore:        restore,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refusing to reuse")
+}
+
 func TestRestorePlugin_Execute_AlreadyExists_MissingOperationIDAnnotation(t *testing.T) {
 	const pvcName = testRestorePVCName
 
@@ -582,8 +632,13 @@ func TestRestorePlugin_Execute_AlreadyExists_MissingOperationIDAnnotation(t *tes
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      existingName,
 			Namespace: testVeleroNS,
+			Annotations: map[string]string{
+				controllercommon.AnnotationVMName:      "my-vm",
+				controllercommon.AnnotationVMNamespace: testOrigNamespace,
+			},
 		},
 		Spec: velerov2alpha1.DataDownloadSpec{
+			SourceNamespace: testOrigNamespace,
 			TargetVolume: velerov2alpha1.TargetVolumeSpec{
 				PVC:       pvcName,
 				Namespace: testOrigNamespace,
@@ -645,9 +700,12 @@ func TestRestorePlugin_Execute_AlreadyExists_MissingOperationIDLabel(t *testing.
 			},
 			Annotations: map[string]string{
 				controllercommon.AnnotationOperationID: existingOperationID,
+				controllercommon.AnnotationVMName:      "my-vm",
+				controllercommon.AnnotationVMNamespace: testOrigNamespace,
 			},
 		},
 		Spec: velerov2alpha1.DataDownloadSpec{
+			SourceNamespace: testOrigNamespace,
 			TargetVolume: velerov2alpha1.TargetVolumeSpec{
 				PVC:       pvcName,
 				Namespace: testOrigNamespace,
@@ -694,7 +752,9 @@ type countingCRClient struct {
 }
 
 func (c *countingCRClient) Get(ctx context.Context, key crclient.ObjectKey, obj crclient.Object, opts ...crclient.GetOption) error {
-	c.getCount++
+	if _, ok := obj.(*velerov1.Backup); ok {
+		c.getCount++
+	}
 	return c.Client.Get(ctx, key, obj, opts...)
 }
 
@@ -754,23 +814,26 @@ func TestRestorePlugin_Execute_SameNamedPVCDifferentNamespaces(t *testing.T) {
 	// these would collide on both DataDownload name and operationID even though
 	// they're unrelated Kubernetes objects.
 	const sharedPVCName = "shared-pvc-name"
+	operationIDs := make([]string, 0, 2)
 	for _, ns := range []string{"ns-a", "ns-b"} {
 		pvc := newRestorePVC(ns, sharedPVCName, map[string]string{
 			controllercommon.AnnotationVMName: "my-vm",
 		})
 		pvcItem := restorePVCToUnstructured(t, pvc)
-		_, err := plugin.Execute(&velero.RestoreItemActionExecuteInput{
+		output, err := plugin.Execute(&velero.RestoreItemActionExecuteInput{
 			Item:           pvcItem,
 			ItemFromBackup: pvcItem,
 			Restore:        restore,
 		})
 		require.NoError(t, err, "same-named PVCs from different source namespaces within one restore must not collide")
+		operationIDs = append(operationIDs, output.OperationID)
 	}
 
 	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datadownloads"}
 	list, err := fakeDynamic.Resource(gvr).Namespace(testVeleroNS).List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
 	assert.Len(t, list.Items, 2, "each source namespace's PVC must get its own DataDownload, not a collided/reused one")
+	assert.NotEqual(t, operationIDs[0], operationIDs[1], "same-named PVCs from different source namespaces must get distinct operation IDs")
 }
 
 func TestRestorePlugin_Progress(t *testing.T) {
@@ -1148,7 +1211,7 @@ func TestGenerateDataDownloadName(t *testing.T) {
 	name := generateDataDownloadName("restore-1", "ns-1", "pvc-1")
 
 	assert.NotEmpty(t, name)
-	assert.Contains(t, name, "dd-")
+	assert.True(t, strings.HasPrefix(name, "dd-"), "name must start with the dd- prefix, got %q", name)
 	assert.Contains(t, name, "restore-1")
 	assert.Contains(t, name, "ns-1")
 	assert.Contains(t, name, "pvc-1")

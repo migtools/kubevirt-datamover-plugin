@@ -36,6 +36,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/ptr"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -508,6 +509,7 @@ func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *veler
 					Kind:       "Backup",
 					Name:       backup.Name,
 					UID:        backup.UID,
+					Controller: ptr.To(true),
 				},
 			},
 		},

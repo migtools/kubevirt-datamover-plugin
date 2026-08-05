@@ -75,6 +75,9 @@ Handles PersistentVolumeClaim resources during restore:
   KubeVirt Datamover Controller's restore path (qcow2-to-raw conversion)
 - Returns an async operation ID for progress tracking, mirroring the backup-side
   DataUpload flow
+- Honors `Restore.Spec.NamespaceMapping`: `Spec.TargetVolume.Namespace` is set
+  to the remapped namespace, while `Spec.SourceNamespace` stays the original,
+  pre-remap namespace
 - Operates at the PVC level (not VM level), so multi-disk VMs are handled
   naturally: one `DataDownload` per PVC, no special-casing required
 
