@@ -361,6 +361,31 @@ func TestClearPVCBinding(t *testing.T) {
 	assert.True(t, found, "clearPVCBinding must not mutate the passed-in item")
 }
 
+// nonUnstructuredCopyItem wraps a real *unstructured.Unstructured but breaks
+// the runtime.Unstructured contract on DeepCopyObject, simulating an item
+// implementation whose deep copy doesn't preserve the interface -- used to
+// exercise clearPVCBinding's defensive type-assertion failure path, which no
+// real Velero-supplied item is expected to hit but should still fail loudly
+// rather than panic if it ever did.
+type nonUnstructuredCopyItem struct {
+	*unstructured.Unstructured
+}
+
+func (n *nonUnstructuredCopyItem) DeepCopyObject() runtime.Object {
+	return &corev1.Pod{}
+}
+
+func TestClearPVCBinding_DeepCopyNotUnstructured(t *testing.T) {
+	pvc := newRestorePVC(testOrigNamespace, testRestorePVCName, nil)
+	item := restorePVCToUnstructured(t, pvc).(*unstructured.Unstructured)
+	badItem := &nonUnstructuredCopyItem{Unstructured: item}
+
+	_, err := clearPVCBinding(badItem)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to copy restore item")
+}
+
 func TestRestorePlugin_Execute_LongOperationIDTruncatedInLabel(t *testing.T) {
 	fakeDynamic := newDataDownloadDynamicClient(t)
 	withFakeDynamicClient(t, fakeDynamic)
