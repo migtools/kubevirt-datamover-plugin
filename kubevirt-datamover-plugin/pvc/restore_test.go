@@ -233,7 +233,7 @@ func TestRestorePlugin_Execute_Eligible(t *testing.T) {
 				Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
 			}
 			fakeCRClient := getFakeCRClient(t, backup)
-			plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+			plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
 			require.NoError(t, err)
 
 			pvc := newRestorePVC(testOrigNamespace, testRestorePVCName, map[string]string{
@@ -310,7 +310,7 @@ func TestRestorePlugin_Execute_LongOperationIDTruncatedInLabel(t *testing.T) {
 		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
 	}
 	fakeCRClient := getFakeCRClient(t, backup)
-	plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
 	require.NoError(t, err)
 
 	longRestoreName := strings.Repeat("r", 40)
@@ -358,7 +358,7 @@ func TestRestorePlugin_Execute_MissingBackup(t *testing.T) {
 
 	// No Backup object seeded into the fake CR client.
 	fakeCRClient := getFakeCRClient(t)
-	plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
 	require.NoError(t, err)
 
 	pvc := newRestorePVC(testOrigNamespace, testRestorePVCName, map[string]string{
@@ -389,7 +389,7 @@ func TestRestorePlugin_Execute_MissingStorageLocation(t *testing.T) {
 		// StorageLocation deliberately left empty.
 	}
 	fakeCRClient := getFakeCRClient(t, backup)
-	plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
 	require.NoError(t, err)
 
 	pvc := newRestorePVC(testOrigNamespace, testRestorePVCName, map[string]string{
@@ -423,7 +423,7 @@ func TestRestorePlugin_Execute_CreateDataDownloadFails(t *testing.T) {
 		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
 	}
 	fakeCRClient := getFakeCRClient(t, backup)
-	plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
 	require.NoError(t, err)
 
 	pvc := newRestorePVC(testOrigNamespace, testRestorePVCName, map[string]string{
@@ -469,6 +469,7 @@ func TestRestorePlugin_Execute_AlreadyExists_Reuse(t *testing.T) {
 				controllercommon.AnnotationVMNamespace: testOrigNamespace,
 				controllercommon.AnnotationOperationID: existingOperationID,
 			},
+			OwnerReferences: []metav1.OwnerReference{{UID: "restore-uid"}},
 		},
 		Spec: velerov2alpha1.DataDownloadSpec{
 			DataMover:             controllercommon.DataMoverKubeVirt,
@@ -489,7 +490,7 @@ func TestRestorePlugin_Execute_AlreadyExists_Reuse(t *testing.T) {
 		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
 	}
 	fakeCRClient := getFakeCRClient(t, backup)
-	plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
 	require.NoError(t, err)
 
 	pvc := newRestorePVC(testOrigNamespace, pvcName, map[string]string{
@@ -497,7 +498,7 @@ func TestRestorePlugin_Execute_AlreadyExists_Reuse(t *testing.T) {
 	})
 	pvcItem := restorePVCToUnstructured(t, pvc)
 	restore := &velerov1.Restore{
-		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS},
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS, UID: "restore-uid"},
 		Spec:       velerov1.RestoreSpec{BackupName: testOrigBackupName},
 	}
 
@@ -515,6 +516,75 @@ func TestRestorePlugin_Execute_AlreadyExists_Reuse(t *testing.T) {
 	list, err := fakeDynamic.Resource(gvr).Namespace(testVeleroNS).List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
 	assert.Len(t, list.Items, 1, "Execute must not create a duplicate DataDownload for a retried call")
+}
+
+func TestRestorePlugin_Execute_AlreadyExists_ReuseWithDivergentStoredOperationID(t *testing.T) {
+	const pvcName = testRestorePVCName
+	// Deliberately NOT generateOperationID(...)'s output -- simulates an existing
+	// DataDownload created by a plugin build with a different ID scheme. Execute
+	// must return this stored value, not the freshly (re)computed one, since
+	// that's the ID Progress/Cancel will actually be called with.
+	const storedOperationID = "unrelated-stored-operation-id"
+
+	existingName := generateDataDownloadName(testRestoreName, testOrigNamespace, pvcName)
+
+	existing := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      existingName,
+			Namespace: testVeleroNS,
+			Labels: map[string]string{
+				controllercommon.LabelVeleroBackupName:  controllercommon.SafeLabelValue(testOrigBackupName),
+				controllercommon.LabelVeleroRestoreName: controllercommon.SafeLabelValue(testRestoreName),
+				controllercommon.AnnotationOperationID:  controllercommon.SafeLabelValue(storedOperationID),
+			},
+			Annotations: map[string]string{
+				controllercommon.AnnotationVMName:      "my-vm",
+				controllercommon.AnnotationVMNamespace: testOrigNamespace,
+				controllercommon.AnnotationOperationID: storedOperationID,
+			},
+			OwnerReferences: []metav1.OwnerReference{{UID: "restore-uid"}},
+		},
+		Spec: velerov2alpha1.DataDownloadSpec{
+			DataMover:             controllercommon.DataMoverKubeVirt,
+			BackupStorageLocation: "my-bsl",
+			SourceNamespace:       testOrigNamespace,
+			TargetVolume: velerov2alpha1.TargetVolumeSpec{
+				PVC:       pvcName,
+				Namespace: testOrigNamespace,
+			},
+		},
+	}
+
+	fakeDynamic := newDataDownloadDynamicClient(t, dataDownloadUnstructured(t, existing))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testOrigBackupName, Namespace: testVeleroNS},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	fakeCRClient := getFakeCRClient(t, backup)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
+	require.NoError(t, err)
+
+	pvc := newRestorePVC(testOrigNamespace, pvcName, map[string]string{
+		controllercommon.AnnotationVMName: "my-vm",
+	})
+	pvcItem := restorePVCToUnstructured(t, pvc)
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS, UID: "restore-uid"},
+		Spec:       velerov1.RestoreSpec{BackupName: testOrigBackupName},
+	}
+
+	output, err := plugin.Execute(&velero.RestoreItemActionExecuteInput{
+		Item:           pvcItem,
+		ItemFromBackup: pvcItem,
+		Restore:        restore,
+	})
+
+	require.NoError(t, err, "Execute must reuse the existing DataDownload instead of erroring on AlreadyExists")
+	require.NotNil(t, output)
+	assert.Equal(t, storedOperationID, output.OperationID, "Execute must return the operationID stored on the existing object, not a freshly generated one")
+	assert.NotEqual(t, generateOperationID(testRestoreName, testOrigNamespace, pvcName), output.OperationID)
 }
 
 func TestRestorePlugin_Execute_AlreadyExists_Mismatch(t *testing.T) {
@@ -545,7 +615,7 @@ func TestRestorePlugin_Execute_AlreadyExists_Mismatch(t *testing.T) {
 		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
 	}
 	fakeCRClient := getFakeCRClient(t, backup)
-	plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
 	require.NoError(t, err)
 
 	pvc := newRestorePVC(testOrigNamespace, pvcName, map[string]string{
@@ -565,6 +635,7 @@ func TestRestorePlugin_Execute_AlreadyExists_Mismatch(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "refusing to reuse")
+	assert.Contains(t, err.Error(), "some-other-pvc")
 }
 
 func TestRestorePlugin_Execute_AlreadyExists_NamespaceMismatch(t *testing.T) {
@@ -595,7 +666,7 @@ func TestRestorePlugin_Execute_AlreadyExists_NamespaceMismatch(t *testing.T) {
 		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
 	}
 	fakeCRClient := getFakeCRClient(t, backup)
-	plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
 	require.NoError(t, err)
 
 	pvc := newRestorePVC(testOrigNamespace, pvcName, map[string]string{
@@ -615,6 +686,7 @@ func TestRestorePlugin_Execute_AlreadyExists_NamespaceMismatch(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "refusing to reuse")
+	assert.Contains(t, err.Error(), "some-other-ns")
 }
 
 func TestRestorePlugin_Execute_AlreadyExists_MissingOperationIDAnnotation(t *testing.T) {
@@ -636,9 +708,12 @@ func TestRestorePlugin_Execute_AlreadyExists_MissingOperationIDAnnotation(t *tes
 				controllercommon.AnnotationVMName:      "my-vm",
 				controllercommon.AnnotationVMNamespace: testOrigNamespace,
 			},
+			OwnerReferences: []metav1.OwnerReference{{UID: "restore-uid"}},
 		},
 		Spec: velerov2alpha1.DataDownloadSpec{
-			SourceNamespace: testOrigNamespace,
+			DataMover:             controllercommon.DataMoverKubeVirt,
+			BackupStorageLocation: "my-bsl",
+			SourceNamespace:       testOrigNamespace,
 			TargetVolume: velerov2alpha1.TargetVolumeSpec{
 				PVC:       pvcName,
 				Namespace: testOrigNamespace,
@@ -654,7 +729,7 @@ func TestRestorePlugin_Execute_AlreadyExists_MissingOperationIDAnnotation(t *tes
 		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
 	}
 	fakeCRClient := getFakeCRClient(t, backup)
-	plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
 	require.NoError(t, err)
 
 	pvc := newRestorePVC(testOrigNamespace, pvcName, map[string]string{
@@ -662,7 +737,7 @@ func TestRestorePlugin_Execute_AlreadyExists_MissingOperationIDAnnotation(t *tes
 	})
 	pvcItem := restorePVCToUnstructured(t, pvc)
 	restore := &velerov1.Restore{
-		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS},
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS, UID: "restore-uid"},
 		Spec:       velerov1.RestoreSpec{BackupName: testOrigBackupName},
 	}
 
@@ -703,9 +778,12 @@ func TestRestorePlugin_Execute_AlreadyExists_MissingOperationIDLabel(t *testing.
 				controllercommon.AnnotationVMName:      "my-vm",
 				controllercommon.AnnotationVMNamespace: testOrigNamespace,
 			},
+			OwnerReferences: []metav1.OwnerReference{{UID: "restore-uid"}},
 		},
 		Spec: velerov2alpha1.DataDownloadSpec{
-			SourceNamespace: testOrigNamespace,
+			DataMover:             controllercommon.DataMoverKubeVirt,
+			BackupStorageLocation: "my-bsl",
+			SourceNamespace:       testOrigNamespace,
 			TargetVolume: velerov2alpha1.TargetVolumeSpec{
 				PVC:       pvcName,
 				Namespace: testOrigNamespace,
@@ -721,7 +799,7 @@ func TestRestorePlugin_Execute_AlreadyExists_MissingOperationIDLabel(t *testing.
 		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
 	}
 	fakeCRClient := getFakeCRClient(t, backup)
-	plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
 	require.NoError(t, err)
 
 	pvc := newRestorePVC(testOrigNamespace, pvcName, map[string]string{
@@ -729,7 +807,7 @@ func TestRestorePlugin_Execute_AlreadyExists_MissingOperationIDLabel(t *testing.
 	})
 	pvcItem := restorePVCToUnstructured(t, pvc)
 	restore := &velerov1.Restore{
-		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS},
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS, UID: "restore-uid"},
 		Spec:       velerov1.RestoreSpec{BackupName: testOrigBackupName},
 	}
 
@@ -768,7 +846,7 @@ func TestRestorePlugin_Execute_CachesBackupAcrossCalls(t *testing.T) {
 	}
 	counting := &countingCRClient{Client: getFakeCRClient(t, backup)}
 	var crClientIface crclient.Client = counting
-	plugin, err := NewRestorePlugin(newTestLogger(), &crClientIface)
+	plugin, err := NewRestorePlugin(newTestLogger(), crClientIface)
 	require.NoError(t, err)
 
 	restore := &velerov1.Restore{
@@ -801,7 +879,7 @@ func TestRestorePlugin_Execute_SameNamedPVCDifferentNamespaces(t *testing.T) {
 		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
 	}
 	fakeCRClient := getFakeCRClient(t, backup)
-	plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
 	require.NoError(t, err)
 
 	restore := &velerov1.Restore{

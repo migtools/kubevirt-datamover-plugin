@@ -75,12 +75,10 @@ var kubevirtCustomPolicy = map[string]any{
 }
 
 // NewBackupPlugin creates a new BackupPlugin instance.
-func NewBackupPlugin(log logrus.FieldLogger, client *crclient.Client) (*BackupPlugin, error) {
-	var crClient crclient.Client
+func NewBackupPlugin(log logrus.FieldLogger, client crclient.Client) (*BackupPlugin, error) {
+	crClient := client
 	var err error
-	if client != nil {
-		crClient = *client
-	} else {
+	if crClient == nil {
 		crClient, err = clients.CRClient()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get controller-runtime client: %w", err)
@@ -550,6 +548,14 @@ func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *veler
 			return nil, fmt.Errorf("existing DataUpload %s/%s targets %s/%s, not %s/%s -- refusing to reuse it",
 				backup.Namespace, dataUploadName, existing.Spec.SourceNamespace, existing.Spec.SourcePVC, vm.Namespace, sourcePVC.Name)
 		}
+		if !hasOwnerUID(existing.OwnerReferences, backup.UID) {
+			// The name hash includes backup.Name but not backup.UID: a deleted
+			// and recreated Backup with the same name (unusual, but not
+			// impossible) would otherwise let this stale object from a prior
+			// Backup be silently adopted as if it belonged to the current one.
+			return nil, fmt.Errorf("existing DataUpload %s/%s is not owned by Backup %s (UID %s) -- refusing to reuse it",
+				backup.Namespace, dataUploadName, backup.Name, backup.UID)
+		}
 		if existing.Annotations[controllercommon.AnnotationOperationID] == "" {
 			// Without this annotation, Execute() would fall back to the locally
 			// generated operationID, but getDataUploadByOperationID (used by
@@ -602,8 +608,7 @@ func (p *BackupPlugin) getDataUploadByName(name, namespace string) (*velerov2alp
 }
 
 // createDataUploadResource creates the DataUpload CR in the cluster.
-// This is extracted to a method for easier testing/mocking.
-var createDataUploadResource = func(p *BackupPlugin, du *velerov2alpha1.DataUpload) error {
+func (p *BackupPlugin) createDataUploadResource(du *velerov2alpha1.DataUpload) error {
 	config, err := clients.GetInClusterConfig()
 	if err != nil {
 		return fmt.Errorf("failed to get in-cluster config: %w", err)
@@ -647,10 +652,6 @@ var createDataUploadResource = func(p *BackupPlugin, du *velerov2alpha1.DataUplo
 	}
 
 	return nil
-}
-
-func (p *BackupPlugin) createDataUploadResource(du *velerov2alpha1.DataUpload) error {
-	return createDataUploadResource(p, du)
 }
 
 // getDataUploadByOperationID retrieves a DataUpload by its operation ID.
@@ -819,6 +820,19 @@ func buildDataUploadAnnotations(vm *kvcore.VirtualMachine, operationID string) m
 	}
 
 	return annotations
+}
+
+// hasOwnerUID reports whether any of ownerReferences has the given UID.
+// Used to confirm an adopted object actually belongs to the Backup being
+// processed, not to a prior object of the same name left behind by a
+// deleted-and-recreated Backup.
+func hasOwnerUID(ownerReferences []metav1.OwnerReference, uid types.UID) bool {
+	for _, ref := range ownerReferences {
+		if ref.UID == uid {
+			return true
+		}
+	}
+	return false
 }
 
 // deterministicSuffix returns an 8-character hex digest of parts, joined by "/".
