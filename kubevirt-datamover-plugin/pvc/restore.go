@@ -326,7 +326,7 @@ func (p *RestorePlugin) createDataDownload(
 	pvc *corev1.PersistentVolumeClaim,
 	vmName, originalNamespace, targetNamespace, operationID string,
 ) (*velerov2alpha1.DataDownload, error) {
-	dataDownloadName := generateDataDownloadName(restore.Name, pvc.Name)
+	dataDownloadName := generateDataDownloadName(restore.Name, targetNamespace, pvc.Name)
 
 	operationTimeout := metav1.Duration{Duration: 4 * time.Hour}
 	if restore.Spec.ItemOperationTimeout.Duration > 0 {
@@ -413,6 +413,15 @@ func (p *RestorePlugin) createDataDownload(
 		if existing.Spec.TargetVolume.PVC != pvc.Name || existing.Spec.TargetVolume.Namespace != targetNamespace {
 			return nil, fmt.Errorf("existing DataDownload %s/%s targets %s/%s, not %s/%s -- refusing to reuse it",
 				restore.Namespace, dataDownloadName, existing.Spec.TargetVolume.Namespace, existing.Spec.TargetVolume.PVC, targetNamespace, pvc.Name)
+		}
+		if existing.Annotations[controllercommon.AnnotationOperationID] == "" {
+			// Without this annotation, Execute() would fall back to the locally
+			// generated operationID, but getDataDownloadByOperationID (used by
+			// Progress/Cancel) requires an exact annotation match to that ID --
+			// an existing object with none would never be found again, silently
+			// stranding this operation instead of tracking it.
+			return nil, fmt.Errorf("existing DataDownload %s/%s has no %s annotation; refusing to reuse it since progress and cancellation could not track it",
+				restore.Namespace, dataDownloadName, controllercommon.AnnotationOperationID)
 		}
 		p.Log.Infof("[pvc-restore] DataDownload %s/%s already exists for this restore+PVC, reusing it instead of creating a duplicate",
 			restore.Namespace, dataDownloadName)
@@ -644,38 +653,81 @@ func generateOperationID(restoreName, namespace, pvcName string) string {
 	return fmt.Sprintf("%s-%s-%s-%s", restoreName, namespace, pvcName, deterministicSuffix(restoreName, namespace, pvcName))
 }
 
+// distributeTruncationBudget returns, for each of parts, the max byte length
+// it may occupy so the sum is at most maxLen. Parts that already fit keep
+// their full length; any deficit is taken evenly off the longest part(s),
+// repeated until the total fits. Used instead of a fixed halfway split so the
+// same logic works regardless of how many name components are involved.
+func distributeTruncationBudget(maxLen int, parts []string) []int {
+	budgets := make([]int, len(parts))
+	for i, p := range parts {
+		budgets[i] = len(p)
+	}
+	for {
+		total := 0
+		for _, b := range budgets {
+			total += b
+		}
+		over := total - maxLen
+		if over <= 0 {
+			return budgets
+		}
+		largest := 0
+		for _, b := range budgets {
+			if b > largest {
+				largest = b
+			}
+		}
+		if largest == 0 {
+			return budgets
+		}
+		for i := range budgets {
+			if over <= 0 {
+				break
+			}
+			if budgets[i] == largest {
+				budgets[i]--
+				over--
+			}
+		}
+	}
+}
+
 // generateDataDownloadName creates a name for the DataDownload CR.
-// The name format is: dd-<restoreName>-<pvcName>-<hash8>, where hash8 is
-// deterministic (see deterministicSuffix) rather than random, so a retried
-// Execute() call for the same (restore, PVC) reproduces the same name and
-// Create() surfaces AlreadyExists instead of minting a duplicate.
-// If the total length exceeds 253 characters (Kubernetes limit),
-// the restoreName and pvcName are truncated while preserving the hash suffix.
-func generateDataDownloadName(restoreName, pvcName string) string {
-	suffix := deterministicSuffix(restoreName, pvcName)
-	// Reserve space for: "dd-" (3) + "-" (1) + "-" (1) + hash (8) = 13 chars
-	const fixedLen = 13
+// The name format is: dd-<restoreName>-<namespace>-<pvcName>-<hash8>, where
+// hash8 is deterministic (see deterministicSuffix) rather than random, so a
+// retried Execute() call for the same (restore, namespace, PVC) reproduces
+// the same name and Create() surfaces AlreadyExists instead of minting a
+// duplicate. namespace (the PVC's target restore namespace) disambiguates
+// same-named PVCs restored from different source namespaces within one
+// restore -- without it, restoreName+pvcName alone would collide for two such
+// PVCs even though they don't collide as Kubernetes objects.
+// If the total length exceeds 253 characters (Kubernetes limit), the three
+// components are truncated (see distributeTruncationBudget) while preserving
+// the hash suffix.
+func generateDataDownloadName(restoreName, namespace, pvcName string) string {
+	suffix := deterministicSuffix(restoreName, namespace, pvcName)
+	// Reserve space for: "dd-" (3) + "-" + "-" + "-" (3) + hash (8) = 14 chars
+	const fixedLen = 14
 	maxBodyLen := 253 - fixedLen
 
-	totalBodyLen := len(restoreName) + len(pvcName)
+	parts := []string{restoreName, namespace, pvcName}
+	totalBodyLen := len(restoreName) + len(namespace) + len(pvcName)
 	if totalBodyLen > maxBodyLen {
-		halfMax := maxBodyLen / 2
-		if len(restoreName) > halfMax && len(pvcName) > halfMax {
-			restoreName = restoreName[:halfMax]
-			pvcName = pvcName[:maxBodyLen-halfMax]
-		} else if len(restoreName) > halfMax {
-			restoreName = restoreName[:maxBodyLen-len(pvcName)]
-		} else {
-			pvcName = pvcName[:maxBodyLen-len(restoreName)]
+		budgets := distributeTruncationBudget(maxBodyLen, parts)
+		for i, b := range budgets {
+			if b < len(parts[i]) {
+				// A truncation boundary landing mid-name can leave a trailing "-"
+				// or "." (invalid at a DNS-1123 segment boundary); trim it,
+				// matching the same truncation-hygiene rule the controller's
+				// SafeResourceName helper uses.
+				parts[i] = strings.TrimRight(parts[i][:b], "-.")
+			}
 		}
-		// A truncation boundary landing mid-name can leave a trailing "-" or "."
-		// (invalid at a DNS-1123 segment boundary); trim it, matching the same
-		// truncation-hygiene rule the controller's SafeResourceName helper uses.
-		restoreName = strings.TrimRight(restoreName, "-.")
-		pvcName = strings.TrimRight(pvcName, "-.")
+		restoreName, namespace, pvcName = parts[0], parts[1], parts[2]
 	}
 
-	return fmt.Sprintf("dd-%s-%s-%s", restoreName, pvcName, suffix)
+	return fmt.Sprintf("dd-%s-%s-%s-%s", restoreName, namespace, pvcName, suffix)
 }
 
 // getDynamicClient returns a dynamic client for working with unstructured resources.

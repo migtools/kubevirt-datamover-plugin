@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
@@ -73,6 +74,17 @@ func withFakeDynamicClient(t *testing.T, fakeDynamic *dynamicfake.FakeDynamicCli
 
 	clients.SetInClusterConfig(&rest.Config{Host: "https://fake"})
 	t.Cleanup(func() { clients.SetInClusterConfig(nil) })
+}
+
+// withFastCancelBackoff overrides the package-level cancelPatchBackoff with a
+// minimal backoff for the duration of t, restoring the original via
+// t.Cleanup. Used by Cancel retry tests so they don't pay the real ~600ms of
+// sleep the production backoff (200ms, factor 2, 3 steps) would incur.
+func withFastCancelBackoff(t *testing.T) {
+	t.Helper()
+	original := cancelPatchBackoff
+	cancelPatchBackoff = wait.Backoff{Steps: 3, Duration: time.Millisecond, Factor: 1.0}
+	t.Cleanup(func() { cancelPatchBackoff = original })
 }
 
 func newRestorePVC(namespace, name string, annotations map[string]string) *corev1.PersistentVolumeClaim {
@@ -266,8 +278,8 @@ func TestRestorePlugin_Execute_Eligible(t *testing.T) {
 			dd := &velerov2alpha1.DataDownload{}
 			require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(created.Object, dd))
 
-			assert.True(t, strings.HasPrefix(dd.Name, fmt.Sprintf("dd-%s-%s-", testRestoreName, testRestorePVCName)),
-				"DataDownload name must be derived from the restore name and the PVC name via generateDataDownloadName, got %q", dd.Name)
+			assert.True(t, strings.HasPrefix(dd.Name, fmt.Sprintf("dd-%s-%s-%s-", testRestoreName, tc.expectedTargetNS, testRestorePVCName)),
+				"DataDownload name must be derived from the restore name, target namespace, and PVC name via generateDataDownloadName, got %q", dd.Name)
 			assert.Equal(t, controllercommon.SafeLabelValue(testOrigBackupName), dd.Labels[controllercommon.LabelVeleroBackupName])
 			assert.Equal(t, controllercommon.SafeLabelValue(testRestoreName), dd.Labels[controllercommon.LabelVeleroRestoreName])
 			assert.Equal(t, "my-vm", dd.Annotations[controllercommon.AnnotationVMName])
@@ -441,7 +453,7 @@ func TestRestorePlugin_Execute_AlreadyExists_Reuse(t *testing.T) {
 	// simulates a prior Execute() call for this same (restore, PVC) having
 	// already created it (e.g. Velero retried after a transient RPC error).
 	existingOperationID := generateOperationID(testRestoreName, testOrigNamespace, pvcName)
-	existingName := generateDataDownloadName(testRestoreName, pvcName)
+	existingName := generateDataDownloadName(testRestoreName, testOrigNamespace, pvcName)
 
 	existing := &velerov2alpha1.DataDownload{
 		ObjectMeta: metav1.ObjectMeta{
@@ -508,7 +520,7 @@ func TestRestorePlugin_Execute_AlreadyExists_Reuse(t *testing.T) {
 func TestRestorePlugin_Execute_AlreadyExists_Mismatch(t *testing.T) {
 	const pvcName = testRestorePVCName
 
-	existingName := generateDataDownloadName(testRestoreName, pvcName)
+	existingName := generateDataDownloadName(testRestoreName, testOrigNamespace, pvcName)
 
 	// Same deterministic name, but targeting a different PVC -- must not be
 	// mistaken for "our" operation and silently reused.
@@ -555,6 +567,61 @@ func TestRestorePlugin_Execute_AlreadyExists_Mismatch(t *testing.T) {
 	assert.Contains(t, err.Error(), "refusing to reuse")
 }
 
+func TestRestorePlugin_Execute_AlreadyExists_MissingOperationIDAnnotation(t *testing.T) {
+	const pvcName = testRestorePVCName
+
+	existingName := generateDataDownloadName(testRestoreName, testOrigNamespace, pvcName)
+
+	// Same deterministic name and same target PVC/namespace (so the PVC/namespace
+	// match check passes), but missing the operationID annotation entirely -- e.g.
+	// created by an older plugin build with a different tracking scheme. Adopting
+	// it silently would strand Progress/Cancel: they look up DataDownloads by an
+	// exact annotation match against operationID, which this object could never
+	// satisfy.
+	existing := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      existingName,
+			Namespace: testVeleroNS,
+		},
+		Spec: velerov2alpha1.DataDownloadSpec{
+			TargetVolume: velerov2alpha1.TargetVolumeSpec{
+				PVC:       pvcName,
+				Namespace: testOrigNamespace,
+			},
+		},
+	}
+
+	fakeDynamic := newDataDownloadDynamicClient(t, dataDownloadUnstructured(t, existing))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testOrigBackupName, Namespace: testVeleroNS},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	fakeCRClient := getFakeCRClient(t, backup)
+	plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+	require.NoError(t, err)
+
+	pvc := newRestorePVC(testOrigNamespace, pvcName, map[string]string{
+		controllercommon.AnnotationVMName: "my-vm",
+	})
+	pvcItem := restorePVCToUnstructured(t, pvc)
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS},
+		Spec:       velerov1.RestoreSpec{BackupName: testOrigBackupName},
+	}
+
+	_, err = plugin.Execute(&velero.RestoreItemActionExecuteInput{
+		Item:           pvcItem,
+		ItemFromBackup: pvcItem,
+		Restore:        restore,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refusing to reuse")
+	assert.Contains(t, err.Error(), controllercommon.AnnotationOperationID)
+}
+
 // countingCRClient wraps a crclient.Client and counts Get calls, used to prove
 // RestorePlugin.getBackup caches the Backup instead of re-fetching it per PVC.
 type countingCRClient struct {
@@ -599,6 +666,47 @@ func TestRestorePlugin_Execute_CachesBackupAcrossCalls(t *testing.T) {
 	}
 
 	assert.Equal(t, 1, counting.getCount, "the Backup should be fetched once and cached across multiple Execute calls on the same plugin instance")
+}
+
+func TestRestorePlugin_Execute_SameNamedPVCDifferentNamespaces(t *testing.T) {
+	fakeDynamic := newDataDownloadDynamicClient(t)
+	withFakeDynamicClient(t, fakeDynamic)
+
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testOrigBackupName, Namespace: testVeleroNS},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	fakeCRClient := getFakeCRClient(t, backup)
+	plugin, err := NewRestorePlugin(newTestLogger(), &fakeCRClient)
+	require.NoError(t, err)
+
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS, UID: "restore-uid"},
+		Spec:       velerov1.RestoreSpec{BackupName: testOrigBackupName},
+	}
+
+	// Two PVCs with the same name, but from different source namespaces within
+	// the same restore -- without namespace in generateDataDownloadName's inputs,
+	// these would collide on both DataDownload name and operationID even though
+	// they're unrelated Kubernetes objects.
+	const sharedPVCName = "shared-pvc-name"
+	for _, ns := range []string{"ns-a", "ns-b"} {
+		pvc := newRestorePVC(ns, sharedPVCName, map[string]string{
+			controllercommon.AnnotationVMName: "my-vm",
+		})
+		pvcItem := restorePVCToUnstructured(t, pvc)
+		_, err := plugin.Execute(&velero.RestoreItemActionExecuteInput{
+			Item:           pvcItem,
+			ItemFromBackup: pvcItem,
+			Restore:        restore,
+		})
+		require.NoError(t, err, "same-named PVCs from different source namespaces within one restore must not collide")
+	}
+
+	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datadownloads"}
+	list, err := fakeDynamic.Resource(gvr).Namespace(testVeleroNS).List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	assert.Len(t, list.Items, 2, "each source namespace's PVC must get its own DataDownload, not a collided/reused one")
 }
 
 func TestRestorePlugin_Progress(t *testing.T) {
@@ -831,6 +939,8 @@ func TestRestorePlugin_Cancel(t *testing.T) {
 }
 
 func TestRestorePlugin_Cancel_PatchFails(t *testing.T) {
+	withFastCancelBackoff(t)
+
 	const operationID = "op-cancel-2"
 
 	dd := &velerov2alpha1.DataDownload{
@@ -868,6 +978,8 @@ func TestRestorePlugin_Cancel_PatchFails(t *testing.T) {
 }
 
 func TestRestorePlugin_Cancel_RetriesTransientPatchFailure(t *testing.T) {
+	withFastCancelBackoff(t)
+
 	const operationID = "op-cancel-retry-1"
 
 	dd := &velerov2alpha1.DataDownload{
@@ -969,13 +1081,22 @@ func TestGenerateOperationID_Restore(t *testing.T) {
 }
 
 func TestGenerateDataDownloadName(t *testing.T) {
-	name := generateDataDownloadName("restore-1", "pvc-1")
+	name := generateDataDownloadName("restore-1", "ns-1", "pvc-1")
 
 	assert.NotEmpty(t, name)
 	assert.Contains(t, name, "dd-")
 	assert.Contains(t, name, "restore-1")
+	assert.Contains(t, name, "ns-1")
 	assert.Contains(t, name, "pvc-1")
 	assert.LessOrEqual(t, len(name), 253)
+
+	// Same restore+PVC name but a different (target) namespace must produce a
+	// different DataDownload name -- this is what prevents same-named PVCs
+	// restored from different source namespaces within one restore from
+	// colliding on both name and operationID (see generateDataDownloadName's
+	// doc comment).
+	otherNSName := generateDataDownloadName("restore-1", "ns-2", "pvc-1")
+	assert.NotEqual(t, name, otherNSName, "different namespace must produce a different DataDownload name")
 
 	long := func(n int, b byte) string {
 		buf := make([]byte, n)
@@ -988,31 +1109,35 @@ func TestGenerateDataDownloadName(t *testing.T) {
 	truncationCases := []struct {
 		name        string
 		restoreName string
+		namespace   string
 		pvcName     string
 	}{
-		{name: "both long", restoreName: long(200, 'a'), pvcName: long(200, 'b')},
-		{name: "long restore, short pvc", restoreName: long(240, 'a'), pvcName: "pvc-1"},
-		{name: "short restore, long pvc", restoreName: "restore-1", pvcName: long(240, 'b')},
-		// halfMax is 120, so both names are cut at index 120. Placing "-" at
-		// index 119 forces the truncation boundary to land exactly on a
-		// separator, exercising the strings.TrimRight hygiene path.
+		{name: "all three long", restoreName: long(200, 'a'), namespace: long(200, 'c'), pvcName: long(200, 'b')},
+		{name: "long restore, short others", restoreName: long(240, 'a'), namespace: "ns-1", pvcName: "pvc-1"},
+		{name: "long namespace, short others", restoreName: "restore-1", namespace: long(240, 'c'), pvcName: "pvc-1"},
+		{name: "long pvc, short others", restoreName: "restore-1", namespace: "ns-1", pvcName: long(240, 'b')},
+		// Only pvcName is long here, so its truncation budget (maxBodyLen minus
+		// the other two parts' lengths) is exact and hand-computable: 226
+		// chars, landing the cut exactly on the "-" at index 225 and exercising
+		// the strings.TrimRight hygiene path.
 		{
 			name:        "truncation boundary lands on separator",
-			restoreName: long(119, 'a') + "-" + long(120, 'a'),
-			pvcName:     long(119, 'b') + "-" + long(120, 'b'),
+			restoreName: "restore-1",
+			namespace:   "ns-1",
+			pvcName:     long(225, 'b') + "-" + long(50, 'b'),
 		},
 	}
 
 	for _, tc := range truncationCases {
 		t.Run(tc.name, func(t *testing.T) {
-			longName := generateDataDownloadName(tc.restoreName, tc.pvcName)
+			longName := generateDataDownloadName(tc.restoreName, tc.namespace, tc.pvcName)
 			assert.LessOrEqual(t, len(longName), 253, "generated name should not exceed 253 characters")
 			assert.True(t, strings.HasPrefix(longName, "dd-"), "truncated name should keep the dd- prefix")
 			for _, segment := range strings.Split(longName, "-") {
 				assert.NotEmpty(t, segment, "truncation must not leave an empty name segment")
 			}
 			suffix := longName[strings.LastIndex(longName, "-")+1:]
-			assert.Len(t, suffix, 8, "truncated name should keep the full 8-char UUID suffix")
+			assert.Len(t, suffix, 8, "truncated name should keep the full 8-char hash suffix")
 		})
 	}
 }
