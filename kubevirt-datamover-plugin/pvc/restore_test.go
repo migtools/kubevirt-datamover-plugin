@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1180,6 +1181,47 @@ func TestRestorePlugin_Cancel_PatchFails(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to update DataDownload for cancellation")
+}
+
+func TestRestorePlugin_Cancel_DoesNotRetryNonRetryableError(t *testing.T) {
+	withFastCancelBackoff(t)
+
+	const operationID = "op-cancel-nonretryable-1"
+
+	dd := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "dd-cancel-nonretryable",
+			Namespace: testVeleroNS,
+			Labels: map[string]string{
+				controllercommon.LabelVeleroBackupName:  controllercommon.SafeLabelValue(testOrigBackupName),
+				controllercommon.LabelVeleroRestoreName: controllercommon.SafeLabelValue(testRestoreName),
+				controllercommon.AnnotationOperationID:  controllercommon.SafeLabelValue(operationID),
+			},
+			Annotations: map[string]string{
+				controllercommon.AnnotationOperationID: operationID,
+			},
+		},
+		Spec: velerov2alpha1.DataDownloadSpec{Cancel: false},
+	}
+
+	fakeDynamic := newDataDownloadDynamicClient(t, dataDownloadUnstructured(t, dd))
+	attempts := 0
+	fakeDynamic.PrependReactor("patch", "datadownloads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		attempts++
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: "velero.io", Resource: "datadownloads"}, "dd-cancel-nonretryable")
+	})
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &RestorePlugin{Log: newTestLogger()}
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS},
+		Spec:       velerov1.RestoreSpec{BackupName: testOrigBackupName},
+	}
+
+	err := plugin.Cancel(operationID, restore)
+
+	require.Error(t, err)
+	assert.Equal(t, 1, attempts, "a NotFound patch error is not retryable and must stop after a single attempt")
 }
 
 func TestRestorePlugin_Cancel_RetriesTransientPatchFailure(t *testing.T) {

@@ -565,6 +565,14 @@ func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *veler
 			return nil, fmt.Errorf("existing DataUpload %s/%s has no %s annotation; refusing to reuse it since progress and cancellation could not track it",
 				backup.Namespace, dataUploadName, controllercommon.AnnotationOperationID)
 		}
+		if want := controllercommon.SafeLabelValue(backup.Name); existing.Labels[velerov1.BackupNameLabel] != want {
+			// getDataUploadByOperationID narrows server-side via this label
+			// before its annotation re-check, so an object missing it (or with
+			// a divergent value) would be unfindable even though the
+			// annotation above matches.
+			return nil, fmt.Errorf("existing DataUpload %s/%s has label %s=%q, expected %q; refusing to reuse it since progress and cancellation could not find it",
+				backup.Namespace, dataUploadName, velerov1.BackupNameLabel, existing.Labels[velerov1.BackupNameLabel], want)
+		}
 		p.Log.Infof("[vm-backup] DataUpload %s/%s already exists for this backup+VM, reusing it instead of creating a duplicate",
 			backup.Namespace, dataUploadName)
 		return existing, nil

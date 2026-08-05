@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -657,6 +658,7 @@ func TestBackupPlugin_CreateDataUpload_AlreadyExists_Mismatch(t *testing.T) {
 	_, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
 
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "some-other-pvc", "must reject on the source PVC mismatch branch")
 	assert.Contains(t, err.Error(), "refusing to reuse")
 }
 
@@ -693,7 +695,120 @@ func TestBackupPlugin_CreateDataUpload_AlreadyExists_NamespaceMismatch(t *testin
 	_, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
 
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "some-other-namespace", "must reject on the source namespace mismatch branch")
 	assert.Contains(t, err.Error(), "refusing to reuse")
+}
+
+func TestBackupPlugin_CreateDataUpload_AlreadyExists_OwnerUIDMismatch(t *testing.T) {
+	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero", UID: "current-backup-uid"},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
+
+	operationID := generateOperationID(backup.Name, vm.Namespace, vm.Name)
+	existingName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
+
+	// Source matches, but the object's owner reference belongs to a prior
+	// Backup of the same name that was deleted and recreated.
+	existing := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            existingName,
+			Namespace:       backup.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{UID: "stale-backup-uid"}},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			SourcePVC:       sourcePVC.Name,
+			SourceNamespace: vm.Namespace,
+		},
+	}
+
+	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, existing))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	_, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is not owned by Backup")
+}
+
+func TestBackupPlugin_CreateDataUpload_AlreadyExists_NoOperationIDAnnotation(t *testing.T) {
+	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero", UID: "backup-uid"},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
+
+	operationID := generateOperationID(backup.Name, vm.Namespace, vm.Name)
+	existingName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
+
+	// Source and owner match, but Progress and Cancel could never find this
+	// object without the operation-ID annotation.
+	existing := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            existingName,
+			Namespace:       backup.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{UID: backup.UID}},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			SourcePVC:       sourcePVC.Name,
+			SourceNamespace: vm.Namespace,
+		},
+	}
+
+	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, existing))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	_, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), controllercommon.AnnotationOperationID)
+}
+
+func TestBackupPlugin_CreateDataUpload_AlreadyExists_BackupNameLabelMismatch(t *testing.T) {
+	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero", UID: "backup-uid"},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
+
+	operationID := generateOperationID(backup.Name, vm.Namespace, vm.Name)
+	existingName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
+
+	// Source, owner, and operationID annotation all match, but the
+	// BackupNameLabel is missing -- getDataUploadByOperationID selects on it
+	// server-side, so this object would be unreachable for Progress/Cancel.
+	existing := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            existingName,
+			Namespace:       backup.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{UID: backup.UID}},
+			Annotations: map[string]string{
+				controllercommon.AnnotationOperationID: operationID,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			SourcePVC:       sourcePVC.Name,
+			SourceNamespace: vm.Namespace,
+		},
+	}
+
+	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, existing))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	_, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), velerov1.BackupNameLabel)
 }
 
 func TestBackupPlugin_Cancel(t *testing.T) {
@@ -837,6 +952,42 @@ func TestBackupPlugin_Cancel_PatchFails(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to update DataUpload for cancellation")
 	assert.Equal(t, cancelPatchBackoff.Steps, attempts, "Cancel must exhaust the configured retry attempts")
+}
+
+func TestBackupPlugin_Cancel_DoesNotRetryNonRetryableError(t *testing.T) {
+	withFastCancelBackoff(t)
+
+	const operationID = "op-cancel-nonretryable-1"
+	backup := &velerov1.Backup{ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"}}
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "du-cancel-nonretryable",
+			Namespace: backup.Namespace,
+			Labels: map[string]string{
+				velerov1.BackupNameLabel: controllercommon.SafeLabelValue(backup.Name),
+			},
+			Annotations: map[string]string{
+				controllercommon.AnnotationOperationID: operationID,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{Cancel: false},
+	}
+
+	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, du))
+	attempts := 0
+	fakeDynamic.PrependReactor("patch", "datauploads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		attempts++
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: "velero.io", Resource: "datauploads"}, "du-cancel-nonretryable")
+	})
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	err := plugin.Cancel(operationID, backup)
+
+	require.Error(t, err)
+	assert.Equal(t, 1, attempts, "a NotFound patch error is not retryable and must stop after a single attempt")
 }
 
 func TestBackupPlugin_Cancel_NotFound(t *testing.T) {
