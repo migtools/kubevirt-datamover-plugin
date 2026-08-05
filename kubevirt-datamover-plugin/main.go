@@ -40,6 +40,13 @@ func main() {
 		// VirtualMachineBackup/VirtualMachineBackupTracker RestoreItemAction.
 		// Discards these backup-time-only bookkeeping CRs on restore.
 		RegisterRestoreItemAction("kubevirt.io/04-vmbackup-discard-plugin", newVMBackupDiscardPlugin).
+		// VirtualMachine RestoreItemAction for kubevirt datamover.
+		// Halts a kubevirt-datamover-backed VM at restore time (stashing its
+		// original run state in annotations) so its virt-launcher pod cannot
+		// race a WaitForFirstConsumer-bound PVC into a wrong PV before this
+		// VM's DataDownload(s) rebind it. Targets VirtualMachine only, so it
+		// never conflicts with 04's VirtualMachineBackup/Tracker selector.
+		RegisterRestoreItemActionV2("kubevirt.io/05-vm-datamover-restore-plugin", newVMRestorePlugin).
 		Serve()
 }
 
@@ -75,4 +82,13 @@ func newPVCRestorePlugin(logger logrus.FieldLogger) (interface{}, error) {
 // RestoreItemAction plugin that discards these backup-time-only bookkeeping CRs on restore.
 func newVMBackupDiscardPlugin(logger logrus.FieldLogger) (interface{}, error) {
 	return vmbackup.NewDiscardPlugin(logger), nil
+}
+
+// newVMRestorePlugin creates a new VirtualMachine RestoreItemAction plugin.
+// This plugin is responsible for:
+// - Recognizing VMs backed up via the kubevirt datamover (DataUpload annotation)
+// - Halting VMs that were running at backup time, stashing their original run state
+// - Tracking async completion of the VM's sibling DataDownloads via the operation ID
+func newVMRestorePlugin(logger logrus.FieldLogger) (interface{}, error) {
+	return vm.NewRestorePlugin(logger), nil
 }
