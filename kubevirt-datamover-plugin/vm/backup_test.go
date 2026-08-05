@@ -567,6 +567,43 @@ func dataUploadUnstructured(t *testing.T, du *velerov2alpha1.DataUpload) *unstru
 	return u
 }
 
+func TestBackupPlugin_CreateDataUpload_Create(t *testing.T) {
+	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero", UID: "backup-uid"},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
+	const operationID = "op-create-1"
+
+	fakeDynamic := newDataUploadDynamicClient(t)
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	result, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	expectedName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
+	assert.Equal(t, expectedName, result.Name)
+
+	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
+	created, err := fakeDynamic.Resource(gvr).Namespace(backup.Namespace).Get(context.Background(), expectedName, metav1.GetOptions{})
+	require.NoError(t, err)
+	createdDU := &velerov2alpha1.DataUpload{}
+	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(created.Object, createdDU))
+
+	assert.Equal(t, controllercommon.SafeLabelValue(backup.Name), createdDU.Labels[velerov1.BackupNameLabel])
+	assert.Equal(t, operationID, createdDU.Annotations[controllercommon.AnnotationOperationID])
+	require.Len(t, createdDU.OwnerReferences, 1)
+	assert.Equal(t, backup.Name, createdDU.OwnerReferences[0].Name)
+	assert.Equal(t, backup.UID, createdDU.OwnerReferences[0].UID)
+	require.NotNil(t, createdDU.OwnerReferences[0].Controller)
+	assert.True(t, *createdDU.OwnerReferences[0].Controller)
+	assert.Equal(t, result, createdDU, "createDataUpload must return the object it actually created")
+}
+
 func TestBackupPlugin_CreateDataUpload_AlreadyExists_Reuse(t *testing.T) {
 	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
 	backup := &velerov1.Backup{
@@ -1021,6 +1058,9 @@ func TestGenerateOperationID(t *testing.T) {
 
 	operationID4 := generateOperationID("backup-1", "namespace-2", "vm-1")
 	assert.NotEqual(t, operationID, operationID4, "a different namespace must produce a different operation ID")
+
+	operationID5 := generateOperationID("backup-1", "namespace-1", "vm-2")
+	assert.NotEqual(t, operationID, operationID5, "a different VM name must produce a different operation ID")
 }
 
 func TestGenerateDataUploadName(t *testing.T) {
@@ -1032,6 +1072,7 @@ func TestGenerateDataUploadName(t *testing.T) {
 	assert.Contains(t, name, "namespace-1")
 	assert.Contains(t, name, "vm-1")
 	assert.LessOrEqual(t, len(name), 253)
+	assert.Empty(t, validation.IsDNS1123Subdomain(name), "name must be a valid object name")
 
 	// Same backup+VM name but a different namespace must produce a different
 	// DataUpload name -- this is what prevents same-named VMs backed up from
