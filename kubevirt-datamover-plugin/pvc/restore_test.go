@@ -256,10 +256,14 @@ func TestRestorePlugin_Execute_Eligible(t *testing.T) {
 			item := restorePVCToUnstructured(t, itemPVC)
 			originalItem := item.DeepCopyObject().(runtime.Unstructured)
 
-			expectedUpdatedPVC := itemPVC.DeepCopy()
-			expectedUpdatedPVC.Spec.VolumeName = ""
-			expectedUpdatedPVC.Status = corev1.PersistentVolumeClaimStatus{}
-			expectedUpdatedItem := restorePVCToUnstructured(t, expectedUpdatedPVC)
+			// clearPVCBinding removes these fields entirely (via
+			// RemoveNestedField) rather than round-tripping through a typed
+			// struct with them zeroed -- match that here rather than
+			// re-deriving via restorePVCToUnstructured, which would leave an
+			// empty "status": {} behind instead of removing the key.
+			expectedUpdatedItem := item.DeepCopyObject().(runtime.Unstructured)
+			unstructured.RemoveNestedField(expectedUpdatedItem.UnstructuredContent(), "spec", "volumeName")
+			unstructured.RemoveNestedField(expectedUpdatedItem.UnstructuredContent(), "status")
 
 			restore := &velerov1.Restore{
 				ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS, UID: "restore-uid"},
@@ -314,6 +318,47 @@ func TestRestorePlugin_Execute_Eligible(t *testing.T) {
 			assert.Equal(t, restore.UID, dd.OwnerReferences[0].UID)
 		})
 	}
+}
+
+func TestClearPVCBinding(t *testing.T) {
+	pvc := newRestorePVC(testOrigNamespace, testRestorePVCName, map[string]string{
+		controllercommon.AnnotationVMName: "my-vm",
+	})
+	pvc.Spec.VolumeName = "pvc-original-pv"
+	pvc.Status = corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound}
+	item := restorePVCToUnstructured(t, pvc)
+
+	// A field the vendored corev1.PersistentVolumeClaim type doesn't know
+	// about (e.g. from a newer Kubernetes version than this plugin was built
+	// against) must survive -- proving clearPVCBinding operates on the raw
+	// unstructured content instead of round-tripping through the typed
+	// struct, which would silently drop it.
+	require.NoError(t, unstructured.SetNestedField(item.UnstructuredContent(), "some-value", "spec", "someFutureField"))
+
+	cleaned, err := clearPVCBinding(item)
+	require.NoError(t, err)
+
+	_, found, err := unstructured.NestedString(cleaned.UnstructuredContent(), "spec", "volumeName")
+	require.NoError(t, err)
+	assert.False(t, found, "spec.volumeName must be removed")
+
+	_, found, err = unstructured.NestedMap(cleaned.UnstructuredContent(), "status")
+	require.NoError(t, err)
+	assert.False(t, found, "status must be removed")
+
+	futureField, found, err := unstructured.NestedString(cleaned.UnstructuredContent(), "spec", "someFutureField")
+	require.NoError(t, err)
+	assert.True(t, found, "unknown fields must be preserved, not silently dropped")
+	assert.Equal(t, "some-value", futureField)
+
+	name, found, err := unstructured.NestedString(cleaned.UnstructuredContent(), "metadata", "name")
+	require.NoError(t, err)
+	assert.True(t, found)
+	assert.Equal(t, testRestorePVCName, name)
+
+	_, found, err = unstructured.NestedString(item.UnstructuredContent(), "spec", "volumeName")
+	require.NoError(t, err)
+	assert.True(t, found, "clearPVCBinding must not mutate the passed-in item")
 }
 
 func TestRestorePlugin_Execute_LongOperationIDTruncatedInLabel(t *testing.T) {
