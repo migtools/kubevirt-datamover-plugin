@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/ptr"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -147,7 +148,7 @@ func (p *RestorePlugin) Execute(input *velero.RestoreItemActionExecuteInput) (*v
 			restore.Namespace, restore.Spec.BackupName, pvc.Namespace, pvc.Name)
 	}
 
-	operationID := generateOperationID(restore.Name, targetNamespace, pvc.Name)
+	operationID := generateOperationID(restore.Name, originalNamespace, pvc.Name)
 	p.Log.Infof("[pvc-restore] Generated operation ID: %s", operationID)
 
 	dataDownload, err := p.createDataDownload(restore, backup, pvc, vmName, originalNamespace, targetNamespace, operationID)
@@ -326,7 +327,7 @@ func (p *RestorePlugin) createDataDownload(
 	pvc *corev1.PersistentVolumeClaim,
 	vmName, originalNamespace, targetNamespace, operationID string,
 ) (*velerov2alpha1.DataDownload, error) {
-	dataDownloadName := generateDataDownloadName(restore.Name, targetNamespace, pvc.Name)
+	dataDownloadName := generateDataDownloadName(restore.Name, originalNamespace, pvc.Name)
 
 	operationTimeout := metav1.Duration{Duration: 4 * time.Hour}
 	if restore.Spec.ItemOperationTimeout.Duration > 0 {
@@ -362,6 +363,7 @@ func (p *RestorePlugin) createDataDownload(
 					Kind:       "Restore",
 					Name:       restore.Name,
 					UID:        restore.UID,
+					Controller: ptr.To(true),
 				},
 			},
 		},
@@ -413,6 +415,14 @@ func (p *RestorePlugin) createDataDownload(
 		if existing.Spec.TargetVolume.PVC != pvc.Name || existing.Spec.TargetVolume.Namespace != targetNamespace {
 			return nil, fmt.Errorf("existing DataDownload %s/%s targets %s/%s, not %s/%s -- refusing to reuse it",
 				restore.Namespace, dataDownloadName, existing.Spec.TargetVolume.Namespace, existing.Spec.TargetVolume.PVC, targetNamespace, pvc.Name)
+		}
+		if existing.Spec.SourceNamespace != originalNamespace ||
+			existing.Annotations[controllercommon.AnnotationVMNamespace] != originalNamespace ||
+			existing.Annotations[controllercommon.AnnotationVMName] != vmName {
+			return nil, fmt.Errorf("existing DataDownload %s/%s has source namespace %q / VM %s/%s, not %s/%s -- refusing to reuse it",
+				restore.Namespace, dataDownloadName, existing.Spec.SourceNamespace,
+				existing.Annotations[controllercommon.AnnotationVMNamespace], existing.Annotations[controllercommon.AnnotationVMName],
+				originalNamespace, vmName)
 		}
 		if existing.Annotations[controllercommon.AnnotationOperationID] == "" {
 			// Without this annotation, Execute() would fall back to the locally
@@ -661,9 +671,12 @@ func deterministicSuffix(parts ...string) string {
 }
 
 // generateOperationID creates a deterministic operation ID for tracking async
-// restore operations: the same (restoreName, namespace, pvcName) always yields
-// the same ID, so a retried Execute() call for the same item converges on the
-// same DataDownload's annotation rather than one Progress/Cancel can't find.
+// restore operations: the same (restoreName, originalNamespace, pvcName)
+// always yields the same ID, so a retried Execute() call for the same item
+// converges on the same DataDownload's annotation rather than one
+// Progress/Cancel can't find. originalNamespace (not the restore-remapped
+// target namespace) is used so identity is tied to the actual source PVC,
+// not to a NamespaceMapping value the plugin doesn't control the injectivity of.
 func generateOperationID(restoreName, namespace, pvcName string) string {
 	return fmt.Sprintf("%s-%s-%s-%s", restoreName, namespace, pvcName, deterministicSuffix(restoreName, namespace, pvcName))
 }
@@ -713,10 +726,11 @@ func distributeTruncationBudget(maxLen int, parts []string) []int {
 // hash8 is deterministic (see deterministicSuffix) rather than random, so a
 // retried Execute() call for the same (restore, namespace, PVC) reproduces
 // the same name and Create() surfaces AlreadyExists instead of minting a
-// duplicate. namespace (the PVC's target restore namespace) disambiguates
-// same-named PVCs restored from different source namespaces within one
-// restore -- without it, restoreName+pvcName alone would collide for two such
-// PVCs even though they don't collide as Kubernetes objects.
+// duplicate. namespace is the PVC's original (pre-remap) source namespace,
+// not the restore-remapped target namespace -- using the source identity
+// disambiguates same-named PVCs restored from different source namespaces
+// within one restore without depending on restore.Spec.NamespaceMapping
+// being injective (which nothing enforces).
 // If the total length exceeds 253 characters (Kubernetes limit), the three
 // components are truncated (see distributeTruncationBudget) while preserving
 // the hash suffix.

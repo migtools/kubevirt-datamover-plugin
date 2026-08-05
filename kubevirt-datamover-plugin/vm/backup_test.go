@@ -711,7 +711,25 @@ func TestBackupPlugin_Cancel(t *testing.T) {
 		Spec: velerov2alpha1.DataUploadSpec{Cancel: false},
 	}
 
-	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, du))
+	// A decoy DataUpload sharing the same backup label (as a second VM backed up
+	// in the same backup would) but a different operationID: proves Cancel only
+	// patches the DataUpload matching the supplied operationID and leaves the
+	// decoy's Spec.Cancel untouched.
+	decoy := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "du-cancel-decoy",
+			Namespace: backup.Namespace,
+			Labels: map[string]string{
+				velerov1.BackupNameLabel: controllercommon.SafeLabelValue(backup.Name),
+			},
+			Annotations: map[string]string{
+				controllercommon.AnnotationOperationID: "op-cancel-decoy",
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{Cancel: false},
+	}
+
+	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, du), dataUploadUnstructured(t, decoy))
 	withFakeDynamicClient(t, fakeDynamic)
 
 	plugin := &BackupPlugin{Log: newTestLogger()}
@@ -725,6 +743,12 @@ func TestBackupPlugin_Cancel(t *testing.T) {
 	updatedDU := &velerov2alpha1.DataUpload{}
 	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(updated.Object, updatedDU))
 	assert.True(t, updatedDU.Spec.Cancel)
+
+	decoyAfter, err := fakeDynamic.Resource(gvr).Namespace(backup.Namespace).Get(context.Background(), "du-cancel-decoy", metav1.GetOptions{})
+	require.NoError(t, err)
+	decoyDU := &velerov2alpha1.DataUpload{}
+	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(decoyAfter.Object, decoyDU))
+	assert.False(t, decoyDU.Spec.Cancel, "Cancel must not touch DataUploads for other operations")
 }
 
 func TestBackupPlugin_Cancel_RetriesTransientPatchFailure(t *testing.T) {
@@ -874,6 +898,15 @@ func TestGenerateDataUploadName(t *testing.T) {
 
 	longName := generateDataUploadName(string(longBackupName), "namespace-1", string(longVMName))
 	assert.LessOrEqual(t, len(longName), 253, "generated name should not exceed 253 characters")
+
+	// Two long backup names sharing the same truncated prefix (only the very
+	// last byte differs, past where truncation would cut) must still produce
+	// distinct DataUpload names -- the hash suffix is computed over the full,
+	// untruncated inputs, so it's what actually guarantees uniqueness once
+	// truncation collapses the visible prefix to the same bytes.
+	otherLongBackupName := string(longBackupName[:199]) + "c"
+	otherLongName := generateDataUploadName(otherLongBackupName, "namespace-1", string(longVMName))
+	assert.NotEqual(t, longName, otherLongName, "long inputs must retain unique DataUpload names")
 }
 
 func TestBackupPlugin_Progress(t *testing.T) {
