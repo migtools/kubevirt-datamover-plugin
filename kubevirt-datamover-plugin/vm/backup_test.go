@@ -578,7 +578,7 @@ func TestBackupPlugin_CreateDataUpload_AlreadyExists_Reuse(t *testing.T) {
 	// this simulates a prior Execute() call for this same (backup, VM) having
 	// already created it (e.g. Velero retried after a transient RPC error).
 	operationID := generateOperationID(backup.Name, vm.Namespace, vm.Name)
-	existingName := generateDataUploadName(backup.Name, vm.Name)
+	existingName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
 
 	existing := &velerov2alpha1.DataUpload{
 		ObjectMeta: metav1.ObjectMeta{
@@ -594,7 +594,13 @@ func TestBackupPlugin_CreateDataUpload_AlreadyExists_Reuse(t *testing.T) {
 			},
 		},
 		Spec: velerov2alpha1.DataUploadSpec{
-			SourcePVC: sourcePVC.Name,
+			SourcePVC:       sourcePVC.Name,
+			SourceNamespace: vm.Namespace,
+			// Distinguishes the fetched-from-cluster object from the locally
+			// built one, so this test actually proves the adoption path
+			// returns what's in the cluster rather than trivially matching
+			// locally-derived name/operationID values that would match either way.
+			BackupStorageLocation: "seeded-bsl",
 		},
 	}
 
@@ -608,6 +614,8 @@ func TestBackupPlugin_CreateDataUpload_AlreadyExists_Reuse(t *testing.T) {
 	require.NoError(t, err, "createDataUpload must reuse the existing DataUpload instead of erroring on AlreadyExists")
 	assert.Equal(t, existingName, result.Name)
 	assert.Equal(t, operationID, result.Annotations[controllercommon.AnnotationOperationID])
+	assert.Equal(t, "seeded-bsl", result.Spec.BackupStorageLocation,
+		"createDataUpload must return the object fetched from the cluster, not the locally built one")
 
 	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
 	list, err := fakeDynamic.Resource(gvr).Namespace(backup.Namespace).List(context.Background(), metav1.ListOptions{})
@@ -624,7 +632,7 @@ func TestBackupPlugin_CreateDataUpload_AlreadyExists_Mismatch(t *testing.T) {
 	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
 
 	operationID := generateOperationID(backup.Name, vm.Namespace, vm.Name)
-	existingName := generateDataUploadName(backup.Name, vm.Name)
+	existingName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
 
 	// Same deterministic name, but a different SourcePVC -- must not be mistaken
 	// for "our" operation and silently reused.
@@ -635,6 +643,42 @@ func TestBackupPlugin_CreateDataUpload_AlreadyExists_Mismatch(t *testing.T) {
 		},
 		Spec: velerov2alpha1.DataUploadSpec{
 			SourcePVC: "some-other-pvc",
+		},
+	}
+
+	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, existing))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	_, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refusing to reuse")
+}
+
+func TestBackupPlugin_CreateDataUpload_AlreadyExists_NamespaceMismatch(t *testing.T) {
+	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
+
+	operationID := generateOperationID(backup.Name, vm.Namespace, vm.Name)
+	existingName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
+
+	// Same deterministic name and the same SourcePVC name, but a different
+	// SourceNamespace -- e.g. a same-named VM backed up from a different
+	// namespace. Must not be mistaken for "our" operation and silently reused.
+	existing := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      existingName,
+			Namespace: backup.Namespace,
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			SourcePVC:       sourcePVC.Name,
+			SourceNamespace: "some-other-namespace",
 		},
 	}
 
@@ -752,7 +796,9 @@ func TestBackupPlugin_Cancel_PatchFails(t *testing.T) {
 	}
 
 	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, du))
+	attempts := 0
 	fakeDynamic.PrependReactor("patch", "datauploads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		attempts++
 		return true, nil, fmt.Errorf("simulated patch failure")
 	})
 	withFakeDynamicClient(t, fakeDynamic)
@@ -763,6 +809,7 @@ func TestBackupPlugin_Cancel_PatchFails(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to update DataUpload for cancellation")
+	assert.Equal(t, cancelPatchBackoff.Steps, attempts, "Cancel must exhaust the configured retry attempts")
 }
 
 func TestBackupPlugin_Cancel_NotFound(t *testing.T) {
@@ -793,16 +840,27 @@ func TestGenerateOperationID(t *testing.T) {
 
 	operationID3 := generateOperationID("backup-2", "namespace-1", "vm-1")
 	assert.NotEqual(t, operationID, operationID3, "different inputs must produce a different operation ID")
+
+	operationID4 := generateOperationID("backup-1", "namespace-2", "vm-1")
+	assert.NotEqual(t, operationID, operationID4, "a different namespace must produce a different operation ID")
 }
 
 func TestGenerateDataUploadName(t *testing.T) {
-	name := generateDataUploadName("backup-1", "vm-1")
+	name := generateDataUploadName("backup-1", "namespace-1", "vm-1")
 
 	assert.NotEmpty(t, name)
 	assert.Contains(t, name, "du-")
 	assert.Contains(t, name, "backup-1")
+	assert.Contains(t, name, "namespace-1")
 	assert.Contains(t, name, "vm-1")
 	assert.LessOrEqual(t, len(name), 253)
+
+	// Same backup+VM name but a different namespace must produce a different
+	// DataUpload name -- this is what prevents same-named VMs backed up from
+	// different namespaces within one backup from colliding on both name and
+	// operationID (see generateDataUploadName's doc comment).
+	otherNSName := generateDataUploadName("backup-1", "namespace-2", "vm-1")
+	assert.NotEqual(t, name, otherNSName, "different namespace must produce a different DataUpload name")
 
 	// Test with very long names
 	longBackupName := make([]byte, 200)
@@ -814,7 +872,7 @@ func TestGenerateDataUploadName(t *testing.T) {
 		longVMName[i] = 'b'
 	}
 
-	longName := generateDataUploadName(string(longBackupName), string(longVMName))
+	longName := generateDataUploadName(string(longBackupName), "namespace-1", string(longVMName))
 	assert.LessOrEqual(t, len(longName), 253, "generated name should not exceed 253 characters")
 }
 

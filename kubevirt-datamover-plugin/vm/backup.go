@@ -481,7 +481,7 @@ func (p *BackupPlugin) getFirstKubevirtPVC(vm *kvcore.VirtualMachine, backup *ve
 
 // createDataUpload creates a DataUpload CR for the kubevirt datamover.
 func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *velerov1.Backup, operationID string, sourcePVC *corev1.PersistentVolumeClaim) (*velerov2alpha1.DataUpload, error) {
-	dataUploadName := generateDataUploadName(backup.Name, vm.Name)
+	dataUploadName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
 
 	// Get the operation timeout from backup or use default (4 hours)
 	// Use ItemOperationTimeout (not CSISnapshotTimeout which is only 10 minutes)
@@ -544,9 +544,18 @@ func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *veler
 		if getErr != nil {
 			return nil, fmt.Errorf("DataUpload %s/%s already exists but could not be re-fetched: %w", backup.Namespace, dataUploadName, getErr)
 		}
-		if existing.Spec.SourcePVC != sourcePVC.Name {
-			return nil, fmt.Errorf("existing DataUpload %s/%s has SourcePVC %s, not %s -- refusing to reuse it",
-				backup.Namespace, dataUploadName, existing.Spec.SourcePVC, sourcePVC.Name)
+		if existing.Spec.SourcePVC != sourcePVC.Name || existing.Spec.SourceNamespace != vm.Namespace {
+			return nil, fmt.Errorf("existing DataUpload %s/%s targets %s/%s, not %s/%s -- refusing to reuse it",
+				backup.Namespace, dataUploadName, existing.Spec.SourceNamespace, existing.Spec.SourcePVC, vm.Namespace, sourcePVC.Name)
+		}
+		if existing.Annotations[controllercommon.AnnotationOperationID] == "" {
+			// Without this annotation, Execute() would fall back to the locally
+			// generated operationID, but getDataUploadByOperationID (used by
+			// Progress/Cancel) requires an exact annotation match to that ID --
+			// an existing object with none would never be found again, silently
+			// stranding this operation instead of tracking it.
+			return nil, fmt.Errorf("existing DataUpload %s/%s has no %s annotation; refusing to reuse it since progress and cancellation could not track it",
+				backup.Namespace, dataUploadName, controllercommon.AnnotationOperationID)
 		}
 		p.Log.Infof("[vm-backup] DataUpload %s/%s already exists for this backup+VM, reusing it instead of creating a duplicate",
 			backup.Namespace, dataUploadName)
@@ -575,7 +584,10 @@ func (p *BackupPlugin) getDataUploadByName(name, namespace string) (*velerov2alp
 		Resource: "datauploads",
 	}
 
-	item, err := dynamicClient.Resource(gvr).Namespace(namespace).Get(context.Background(), name, metav1.GetOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
+	defer cancel()
+
+	item, err := dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get DataUpload: %w", err)
 	}
@@ -620,8 +632,11 @@ var createDataUploadResource = func(p *BackupPlugin, du *velerov2alpha1.DataUplo
 		Resource: "datauploads",
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
+	defer cancel()
+
 	_, err = dynamicClient.Resource(gvr).Namespace(du.Namespace).Create(
-		context.Background(),
+		ctx,
 		unstructuredDU,
 		metav1.CreateOptions{},
 	)
@@ -654,9 +669,12 @@ func (p *BackupPlugin) getDataUploadByOperationID(operationID string, backup *ve
 		Resource: "datauploads",
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
+	defer cancel()
+
 	// List DataUploads in the backup namespace with matching label
 	list, err := dynamicClient.Resource(gvr).Namespace(backup.Namespace).List(
-		context.Background(),
+		ctx,
 		metav1.ListOptions{
 			LabelSelector: fmt.Sprintf("%s=%s", velerov1.BackupNameLabel, controllercommon.SafeLabelValue(backup.Name)),
 		},
@@ -820,38 +838,77 @@ func generateOperationID(backupName, namespace, vmName string) string {
 	return fmt.Sprintf("%s-%s-%s-%s", backupName, namespace, vmName, deterministicSuffix(backupName, namespace, vmName))
 }
 
-// generateDataUploadName creates a name for the DataUpload CR.
-// The name format is: du-<backupName>-<vmName>-<hash8>, where hash8 is
-// deterministic (see deterministicSuffix) rather than random, so a retried
-// Execute() call for the same (backup, VM) reproduces the same name and
-// Create() surfaces AlreadyExists instead of minting a duplicate.
-// If the total length exceeds 253 characters (Kubernetes limit),
-// the backupName and vmName are truncated while preserving the hash suffix.
-func generateDataUploadName(backupName, vmName string) string {
-	suffix := deterministicSuffix(backupName, vmName)
-	// Reserve space for: "du-" (3) + "-" (1) + "-" (1) + hash (8) = 13 chars
-	const fixedLen = 13
-	maxBodyLen := 253 - fixedLen // 240 chars available for backupName + vmName
-
-	// Truncate names if needed, preserving the hash suffix for uniqueness
-	totalBodyLen := len(backupName) + len(vmName)
-	if totalBodyLen > maxBodyLen {
-		// Truncate proportionally, giving slight preference to backupName
-		halfMax := maxBodyLen / 2
-		if len(backupName) > halfMax && len(vmName) > halfMax {
-			// Both are long, truncate both
-			backupName = backupName[:halfMax]
-			vmName = vmName[:maxBodyLen-halfMax]
-		} else if len(backupName) > halfMax {
-			// Only backupName is long
-			backupName = backupName[:maxBodyLen-len(vmName)]
-		} else {
-			// Only vmName is long
-			vmName = vmName[:maxBodyLen-len(backupName)]
+// distributeTruncationBudget returns, for each of parts, the max byte length
+// it may occupy so the sum is at most maxLen. Parts that already fit keep
+// their full length; any deficit is taken evenly off the longest part(s),
+// repeated until the total fits. Used instead of a fixed halfway split so the
+// same logic works regardless of how many name components are involved.
+func distributeTruncationBudget(maxLen int, parts []string) []int {
+	budgets := make([]int, len(parts))
+	for i, p := range parts {
+		budgets[i] = len(p)
+	}
+	for {
+		total := 0
+		for _, b := range budgets {
+			total += b
+		}
+		over := total - maxLen
+		if over <= 0 {
+			return budgets
+		}
+		largest := 0
+		for _, b := range budgets {
+			if b > largest {
+				largest = b
+			}
+		}
+		if largest == 0 {
+			return budgets
+		}
+		for i := range budgets {
+			if over <= 0 {
+				break
+			}
+			if budgets[i] == largest {
+				budgets[i]--
+				over--
+			}
 		}
 	}
+}
 
-	return fmt.Sprintf("du-%s-%s-%s", backupName, vmName, suffix)
+// generateDataUploadName creates a name for the DataUpload CR.
+// The name format is: du-<backupName>-<namespace>-<vmName>-<hash8>, where
+// hash8 is deterministic (see deterministicSuffix) rather than random, so a
+// retried Execute() call for the same (backup, namespace, VM) reproduces the
+// same name and Create() surfaces AlreadyExists instead of minting a
+// duplicate. namespace disambiguates same-named VMs backed up from different
+// namespaces within one backup -- without it, backupName+vmName alone would
+// collide for two such VMs even though they don't collide as Kubernetes
+// objects.
+// If the total length exceeds 253 characters (Kubernetes limit), the three
+// components are truncated (see distributeTruncationBudget) while preserving
+// the hash suffix.
+func generateDataUploadName(backupName, namespace, vmName string) string {
+	suffix := deterministicSuffix(backupName, namespace, vmName)
+	// Reserve space for: "du-" (3) + "-" + "-" + "-" (3) + hash (8) = 14 chars
+	const fixedLen = 14
+	maxBodyLen := 253 - fixedLen
+
+	parts := []string{backupName, namespace, vmName}
+	totalBodyLen := len(backupName) + len(namespace) + len(vmName)
+	if totalBodyLen > maxBodyLen {
+		budgets := distributeTruncationBudget(maxBodyLen, parts)
+		for i, b := range budgets {
+			if b < len(parts[i]) {
+				parts[i] = strings.TrimRight(parts[i][:b], "-.")
+			}
+		}
+		backupName, namespace, vmName = parts[0], parts[1], parts[2]
+	}
+
+	return fmt.Sprintf("du-%s-%s-%s-%s", backupName, namespace, vmName, suffix)
 }
 
 // getDynamicClient returns a dynamic client for working with unstructured resources.
