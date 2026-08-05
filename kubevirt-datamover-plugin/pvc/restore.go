@@ -67,12 +67,10 @@ type RestorePlugin struct {
 const apiCallTimeout = 30 * time.Second
 
 // NewRestorePlugin creates a new RestorePlugin instance.
-func NewRestorePlugin(log logrus.FieldLogger, client *crclient.Client) (*RestorePlugin, error) {
-	var crClient crclient.Client
+func NewRestorePlugin(log logrus.FieldLogger, client crclient.Client) (*RestorePlugin, error) {
+	crClient := client
 	var err error
-	if client != nil {
-		crClient = *client
-	} else {
+	if crClient == nil {
 		crClient, err = clients.CRClient()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get controller-runtime client: %w", err)
@@ -305,7 +303,7 @@ func (p *RestorePlugin) getBackup(restore *velerov1.Restore) (*velerov1.Backup, 
 	p.backupMu.Lock()
 	defer p.backupMu.Unlock()
 
-	if p.cachedBackup != nil {
+	if p.cachedBackup != nil && p.cachedBackup.Name == restore.Spec.BackupName && p.cachedBackup.Namespace == restore.Namespace {
 		return p.cachedBackup, nil
 	}
 
@@ -416,6 +414,14 @@ func (p *RestorePlugin) createDataDownload(
 			return nil, fmt.Errorf("existing DataDownload %s/%s targets %s/%s, not %s/%s -- refusing to reuse it",
 				restore.Namespace, dataDownloadName, existing.Spec.TargetVolume.Namespace, existing.Spec.TargetVolume.PVC, targetNamespace, pvc.Name)
 		}
+		if !hasOwnerUID(existing.OwnerReferences, restore.UID) {
+			// The name hash includes restore.Name but not restore.UID: a deleted
+			// and recreated Restore with the same name (unusual, but not
+			// impossible) would otherwise let this stale object from a prior
+			// Restore be silently adopted as if it belonged to the current one.
+			return nil, fmt.Errorf("existing DataDownload %s/%s is not owned by Restore %s (UID %s) -- refusing to reuse it",
+				restore.Namespace, dataDownloadName, restore.Name, restore.UID)
+		}
 		if existing.Spec.SourceNamespace != originalNamespace ||
 			existing.Annotations[controllercommon.AnnotationVMNamespace] != originalNamespace ||
 			existing.Annotations[controllercommon.AnnotationVMName] != vmName {
@@ -423,6 +429,14 @@ func (p *RestorePlugin) createDataDownload(
 				restore.Namespace, dataDownloadName, existing.Spec.SourceNamespace,
 				existing.Annotations[controllercommon.AnnotationVMNamespace], existing.Annotations[controllercommon.AnnotationVMName],
 				originalNamespace, vmName)
+		}
+		if existing.Spec.DataMover != controllercommon.DataMoverKubeVirt {
+			return nil, fmt.Errorf("existing DataDownload %s/%s uses data mover %q, not %q -- refusing to reuse it",
+				restore.Namespace, dataDownloadName, existing.Spec.DataMover, controllercommon.DataMoverKubeVirt)
+		}
+		if existing.Spec.BackupStorageLocation != backup.Spec.StorageLocation {
+			return nil, fmt.Errorf("existing DataDownload %s/%s uses backup storage location %q, not %q -- refusing to reuse it",
+				restore.Namespace, dataDownloadName, existing.Spec.BackupStorageLocation, backup.Spec.StorageLocation)
 		}
 		if existing.Annotations[controllercommon.AnnotationOperationID] == "" {
 			// Without this annotation, Execute() would fall back to the locally
@@ -491,8 +505,7 @@ func (p *RestorePlugin) getDataDownloadByName(name, namespace string) (*velerov2
 }
 
 // createDataDownloadResource creates the DataDownload CR in the cluster.
-// This is extracted to a method for easier testing/mocking.
-var createDataDownloadResource = func(p *RestorePlugin, dd *velerov2alpha1.DataDownload) error {
+func (p *RestorePlugin) createDataDownloadResource(dd *velerov2alpha1.DataDownload) error {
 	config, err := clients.GetInClusterConfig()
 	if err != nil {
 		return fmt.Errorf("failed to get in-cluster config: %w", err)
@@ -534,10 +547,6 @@ var createDataDownloadResource = func(p *RestorePlugin, dd *velerov2alpha1.DataD
 	}
 
 	return nil
-}
-
-func (p *RestorePlugin) createDataDownloadResource(dd *velerov2alpha1.DataDownload) error {
-	return createDataDownloadResource(p, dd)
 }
 
 // getDataDownloadByOperationID retrieves a DataDownload by its operation ID.
@@ -658,6 +667,19 @@ func (p *RestorePlugin) updateDataDownload(dd *velerov2alpha1.DataDownload) erro
 	}
 
 	return nil
+}
+
+// hasOwnerUID reports whether any of ownerReferences has the given UID.
+// Used to confirm an adopted object actually belongs to the Restore/Backup
+// being processed, not to a prior object of the same name left behind by a
+// deleted-and-recreated Restore/Backup.
+func hasOwnerUID(ownerReferences []metav1.OwnerReference, uid types.UID) bool {
+	for _, ref := range ownerReferences {
+		if ref.UID == uid {
+			return true
+		}
+	}
+	return false
 }
 
 // Used in place of a random UUID for names/IDs that must be stable across a

@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/wait"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/rest"
@@ -66,7 +67,7 @@ func boolPtr(b bool) *bool {
 
 func TestBackupPlugin_AppliesTo(t *testing.T) {
 	fakeClient := getFakeClient()
-	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	plugin, err := NewBackupPlugin(newTestLogger(), fakeClient)
 	require.NoError(t, err)
 
 	selector, err := plugin.AppliesTo()
@@ -79,7 +80,7 @@ func TestBackupPlugin_AppliesTo(t *testing.T) {
 
 func TestBackupPlugin_Name(t *testing.T) {
 	fakeClient := getFakeClient()
-	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	plugin, err := NewBackupPlugin(newTestLogger(), fakeClient)
 	require.NoError(t, err)
 
 	name := plugin.Name()
@@ -89,7 +90,7 @@ func TestBackupPlugin_Name(t *testing.T) {
 
 func TestBackupPlugin_Execute_NilBackup(t *testing.T) {
 	fakeClient := getFakeClient()
-	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	plugin, err := NewBackupPlugin(newTestLogger(), fakeClient)
 	require.NoError(t, err)
 
 	vm := createTestVM(testNamespace, testVMName, kvcore.VirtualMachineStatusRunning)
@@ -103,7 +104,7 @@ func TestBackupPlugin_Execute_NilBackup(t *testing.T) {
 
 func TestBackupPlugin_Execute_SnapshotMoveDataNotEnabled(t *testing.T) {
 	fakeClient := getFakeClient()
-	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	plugin, err := NewBackupPlugin(newTestLogger(), fakeClient)
 	require.NoError(t, err)
 
 	vm := createTestVM(testNamespace, testVMName, kvcore.VirtualMachineStatusRunning)
@@ -129,7 +130,7 @@ func TestBackupPlugin_Execute_SnapshotMoveDataNotEnabled(t *testing.T) {
 
 func TestBackupPlugin_Execute_VMNotRunning(t *testing.T) {
 	fakeClient := getFakeClient()
-	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	plugin, err := NewBackupPlugin(newTestLogger(), fakeClient)
 	require.NoError(t, err)
 
 	vm := createTestVM(testNamespace, testVMName, kvcore.VirtualMachineStatusStopped)
@@ -433,7 +434,7 @@ func TestControllerGetVolumesForVm(t *testing.T) {
 
 func TestBackupPlugin_checkPreconditions(t *testing.T) {
 	fakeClient := getFakeClient()
-	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
+	plugin, err := NewBackupPlugin(newTestLogger(), fakeClient)
 	require.NoError(t, err)
 
 	testCases := []struct {
@@ -568,7 +569,7 @@ func dataUploadUnstructured(t *testing.T, du *velerov2alpha1.DataUpload) *unstru
 func TestBackupPlugin_CreateDataUpload_AlreadyExists_Reuse(t *testing.T) {
 	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
 	backup := &velerov1.Backup{
-		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"},
+		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero", UID: "backup-uid"},
 		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
 	}
 	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
@@ -592,6 +593,7 @@ func TestBackupPlugin_CreateDataUpload_AlreadyExists_Reuse(t *testing.T) {
 				controllercommon.AnnotationVMNamespace: vm.Namespace,
 				controllercommon.AnnotationOperationID: operationID,
 			},
+			OwnerReferences: []metav1.OwnerReference{{UID: backup.UID}},
 		},
 		Spec: velerov2alpha1.DataUploadSpec{
 			SourcePVC:       sourcePVC.Name,
@@ -642,7 +644,8 @@ func TestBackupPlugin_CreateDataUpload_AlreadyExists_Mismatch(t *testing.T) {
 			Namespace: backup.Namespace,
 		},
 		Spec: velerov2alpha1.DataUploadSpec{
-			SourcePVC: "some-other-pvc",
+			SourcePVC:       "some-other-pvc",
+			SourceNamespace: vm.Namespace,
 		},
 	}
 
@@ -898,6 +901,7 @@ func TestGenerateDataUploadName(t *testing.T) {
 
 	longName := generateDataUploadName(string(longBackupName), "namespace-1", string(longVMName))
 	assert.LessOrEqual(t, len(longName), 253, "generated name should not exceed 253 characters")
+	assert.Empty(t, validation.IsDNS1123Subdomain(longName), "truncated name must remain a valid object name")
 
 	// Two long backup names sharing the same truncated prefix (only the very
 	// last byte differs, past where truncation would cut) must still produce
