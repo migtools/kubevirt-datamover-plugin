@@ -16,10 +16,13 @@ package vm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
 	corev1 "k8s.io/api/core/v1"
@@ -28,8 +31,12 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/ptr"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -47,12 +54,16 @@ import (
 	"github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/clients"
 )
 
+// apiCallTimeout bounds each individual Kubernetes API call made by this
+// plugin so a stuck API server can't hang a Velero backup indefinitely.
+const apiCallTimeout = 30 * time.Second
+
 // BackupPlugin is a BackupItemAction plugin for VirtualMachine resources
 // that handles kubevirt incremental backup via DataUpload CRs.
 type BackupPlugin struct {
-	Log logrus.FieldLogger
+	Log               logrus.FieldLogger
 	pluginPVCPodCache PluginPVCPodCache
-	crClient crclient.Client
+	crClient          crclient.Client
 }
 
 type PluginPVCPodCache struct {
@@ -64,18 +75,16 @@ var kubevirtCustomPolicy = map[string]any{
 }
 
 // NewBackupPlugin creates a new BackupPlugin instance.
-func NewBackupPlugin(log logrus.FieldLogger, client *crclient.Client) (*BackupPlugin, error) {
-	var crClient crclient.Client
+func NewBackupPlugin(log logrus.FieldLogger, client crclient.Client) (*BackupPlugin, error) {
+	crClient := client
 	var err error
-	if client != nil {
-		crClient = *client
-	} else {
+	if crClient == nil {
 		crClient, err = clients.CRClient()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get controller-runtime client: %w", err)
 		}
 	}
-	
+
 	return &BackupPlugin{Log: log, crClient: crClient}, nil
 }
 
@@ -160,12 +169,22 @@ func (p *BackupPlugin) Execute(
 	p.Log.Infof("[vm-backup] Created DataUpload %s/%s for VirtualMachine %s/%s",
 		dataUpload.Namespace, dataUpload.Name, vm.Namespace, vm.Name)
 
+	// Read the operationID back off the returned object rather than trusting the
+	// locally-generated value: on the idempotent-reuse path (see createDataUpload)
+	// this is an existing DataUpload that could in principle have been created by
+	// an older plugin build with a different ID scheme, and Progress/Cancel must be
+	// given whatever ID actually matches what's stored on the object.
+	returnedOperationID := operationID
+	if stored := dataUpload.Annotations[controllercommon.AnnotationOperationID]; stored != "" {
+		returnedOperationID = stored
+	}
+
 	// Add DataUpload annotation to VM
 	if vm.Annotations == nil {
 		vm.Annotations = make(map[string]string)
 	}
 	vm.Annotations[velerov1.DataUploadNameAnnotation] = dataUpload.Name
-	vm.Annotations[controllercommon.AnnotationOperationID] = operationID
+	vm.Annotations[controllercommon.AnnotationOperationID] = returnedOperationID
 	vm.Annotations[velerov1.PVCNamespaceNameLabel] = label.GetValidName(fmt.Sprintf("%s.%s", sourcePVC.Namespace, sourcePVC.Name))
 
 	// Convert back to unstructured
@@ -186,7 +205,7 @@ func (p *BackupPlugin) Execute(
 		},
 	}
 
-	return &unstructured.Unstructured{Object: vmMap}, additionalItems, operationID, nil, nil
+	return &unstructured.Unstructured{Object: vmMap}, additionalItems, returnedOperationID, nil, nil
 }
 
 // Progress returns the progress of an async backup operation.
@@ -320,7 +339,6 @@ func CheckPreconditions(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log 
 		return false, "VirtualMachine has PVCs with snapshot volume policy which conflicts with kubevirt datamover", nil
 	}
 
-
 	return true, "", nil
 }
 
@@ -330,7 +348,6 @@ func CheckPreconditions(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log 
 //   - hasKubevirtPolicy: true if VM is eligible for kubevirt datamover
 //   - hasConflictingPolicy: true if any PVC has "snapshot" action (conflicts with kubevirt datamover)
 //   - error: if there was an error checking policies
-//
 func checkVolumePolicies(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log logrus.FieldLogger, vh vhutil.VolumeHelper) (bool, bool, error) {
 	// Get all PVCs associated with this VM using controller common function
 	pvcNames := controllercommon.GetVolumesForVm(vm)
@@ -338,7 +355,6 @@ func checkVolumePolicies(vm *kvcore.VirtualMachine, backup *velerov1.Backup, log
 		log.Infof("[vm-backup] VirtualMachine %s/%s has no PVCs", vm.Namespace, vm.Name)
 		return false, false, nil
 	}
-
 
 	coreClient, err := clients.CoreClient()
 	if err != nil {
@@ -464,7 +480,7 @@ func (p *BackupPlugin) getFirstKubevirtPVC(vm *kvcore.VirtualMachine, backup *ve
 
 // createDataUpload creates a DataUpload CR for the kubevirt datamover.
 func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *velerov1.Backup, operationID string, sourcePVC *corev1.PersistentVolumeClaim) (*velerov2alpha1.DataUpload, error) {
-	dataUploadName := generateDataUploadName(backup.Name, vm.Name)
+	dataUploadName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
 
 	// Get the operation timeout from backup or use default (4 hours)
 	// Use ItemOperationTimeout (not CSISnapshotTimeout which is only 10 minutes)
@@ -491,6 +507,7 @@ func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *veler
 					Kind:       "Backup",
 					Name:       backup.Name,
 					UID:        backup.UID,
+					Controller: ptr.To(true),
 				},
 			},
 		},
@@ -513,15 +530,93 @@ func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *veler
 
 	// Create the DataUpload using the Velero client
 	if err := p.createDataUploadResource(dataUpload); err != nil {
-		return nil, fmt.Errorf("failed to create DataUpload resource: %w", err)
+		if !apierrors.IsAlreadyExists(err) {
+			return nil, fmt.Errorf("failed to create DataUpload resource: %w", err)
+		}
+		// A DataUpload with this deterministic name already exists: a prior
+		// Execute() call for this same (backup, VM) must have created it, and
+		// Velero re-invoked us (e.g. after a transient RPC error). Adopt it
+		// instead of erroring, but only after confirming it actually targets the
+		// same source PVC we were about to create it for -- a name collision
+		// against something else (shouldn't happen given the hash, but cheap to
+		// check) must not be silently treated as "our" operation.
+		existing, getErr := p.getDataUploadByName(dataUploadName, backup.Namespace)
+		if getErr != nil {
+			return nil, fmt.Errorf("DataUpload %s/%s already exists but could not be re-fetched: %w", backup.Namespace, dataUploadName, getErr)
+		}
+		if existing.Spec.SourcePVC != sourcePVC.Name || existing.Spec.SourceNamespace != vm.Namespace {
+			return nil, fmt.Errorf("existing DataUpload %s/%s targets %s/%s, not %s/%s -- refusing to reuse it",
+				backup.Namespace, dataUploadName, existing.Spec.SourceNamespace, existing.Spec.SourcePVC, vm.Namespace, sourcePVC.Name)
+		}
+		if !hasOwnerUID(existing.OwnerReferences, backup.UID) {
+			// The name hash includes backup.Name but not backup.UID: a deleted
+			// and recreated Backup with the same name (unusual, but not
+			// impossible) would otherwise let this stale object from a prior
+			// Backup be silently adopted as if it belonged to the current one.
+			return nil, fmt.Errorf("existing DataUpload %s/%s is not owned by Backup %s (UID %s) -- refusing to reuse it",
+				backup.Namespace, dataUploadName, backup.Name, backup.UID)
+		}
+		if existing.Annotations[controllercommon.AnnotationOperationID] == "" {
+			// Without this annotation, Execute() would fall back to the locally
+			// generated operationID, but getDataUploadByOperationID (used by
+			// Progress/Cancel) requires an exact annotation match to that ID --
+			// an existing object with none would never be found again, silently
+			// stranding this operation instead of tracking it.
+			return nil, fmt.Errorf("existing DataUpload %s/%s has no %s annotation; refusing to reuse it since progress and cancellation could not track it",
+				backup.Namespace, dataUploadName, controllercommon.AnnotationOperationID)
+		}
+		if want := controllercommon.SafeLabelValue(backup.Name); existing.Labels[velerov1.BackupNameLabel] != want {
+			// getDataUploadByOperationID narrows server-side via this label
+			// before its annotation re-check, so an object missing it (or with
+			// a divergent value) would be unfindable even though the
+			// annotation above matches.
+			return nil, fmt.Errorf("existing DataUpload %s/%s has label %s=%q, expected %q; refusing to reuse it since progress and cancellation could not find it",
+				backup.Namespace, dataUploadName, velerov1.BackupNameLabel, existing.Labels[velerov1.BackupNameLabel], want)
+		}
+		p.Log.Infof("[vm-backup] DataUpload %s/%s already exists for this backup+VM, reusing it instead of creating a duplicate",
+			backup.Namespace, dataUploadName)
+		return existing, nil
 	}
 
 	return dataUpload, nil
 }
 
+// getDataUploadByName fetches a single DataUpload by name, used to adopt an
+// existing one when createDataUploadResource reports AlreadyExists.
+func (p *BackupPlugin) getDataUploadByName(name, namespace string) (*velerov2alpha1.DataUpload, error) {
+	config, err := clients.GetInClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
+	}
+
+	dynamicClient, err := getDynamicClient(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get dynamic client: %w", err)
+	}
+
+	gvr := schema.GroupVersionResource{
+		Group:    "velero.io",
+		Version:  "v2alpha1",
+		Resource: "datauploads",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
+	defer cancel()
+
+	item, err := dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get DataUpload: %w", err)
+	}
+
+	du := &velerov2alpha1.DataUpload{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(item.Object, du); err != nil {
+		return nil, fmt.Errorf("failed to convert unstructured to DataUpload: %w", err)
+	}
+	return du, nil
+}
+
 // createDataUploadResource creates the DataUpload CR in the cluster.
-// This is extracted to a method for easier testing/mocking.
-var createDataUploadResource = func(p *BackupPlugin, du *velerov2alpha1.DataUpload) error {
+func (p *BackupPlugin) createDataUploadResource(du *velerov2alpha1.DataUpload) error {
 	config, err := clients.GetInClusterConfig()
 	if err != nil {
 		return fmt.Errorf("failed to get in-cluster config: %w", err)
@@ -552,8 +647,11 @@ var createDataUploadResource = func(p *BackupPlugin, du *velerov2alpha1.DataUplo
 		Resource: "datauploads",
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
+	defer cancel()
+
 	_, err = dynamicClient.Resource(gvr).Namespace(du.Namespace).Create(
-		context.Background(),
+		ctx,
 		unstructuredDU,
 		metav1.CreateOptions{},
 	)
@@ -562,10 +660,6 @@ var createDataUploadResource = func(p *BackupPlugin, du *velerov2alpha1.DataUplo
 	}
 
 	return nil
-}
-
-func (p *BackupPlugin) createDataUploadResource(du *velerov2alpha1.DataUpload) error {
-	return createDataUploadResource(p, du)
 }
 
 // getDataUploadByOperationID retrieves a DataUpload by its operation ID.
@@ -586,9 +680,12 @@ func (p *BackupPlugin) getDataUploadByOperationID(operationID string, backup *ve
 		Resource: "datauploads",
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
+	defer cancel()
+
 	// List DataUploads in the backup namespace with matching label
 	list, err := dynamicClient.Resource(gvr).Namespace(backup.Namespace).List(
-		context.Background(),
+		ctx,
 		metav1.ListOptions{
 			LabelSelector: fmt.Sprintf("%s=%s", velerov1.BackupNameLabel, controllercommon.SafeLabelValue(backup.Name)),
 		},
@@ -644,7 +741,33 @@ func (p *PluginPVCPodCache) getVolumeHelperWithCache(backup *velerov1.Backup, cr
 	return vh, nil
 }
 
-// updateDataUpload updates a DataUpload CR in the cluster.
+// cancelPatchBackoff bounds the retry attempts for updateDataUpload's cancel
+// patch: Velero's own operation-timeout enforcement
+// (backup_operations_controller.go) calls Cancel() at most once and discards
+// its returned error, so a single transient failure here would otherwise leave
+// the DataUpload (and its upload pod) running with no other mechanism to ever
+// retry the cancellation.
+var cancelPatchBackoff = wait.Backoff{
+	Steps:    3,
+	Duration: 200 * time.Millisecond,
+	Factor:   2.0,
+	Jitter:   0.1,
+}
+
+// cancelPatchTotalTimeout bounds the entire updateDataUpload retry loop
+// (all attempts and backoff sleeps combined), not just each individual patch
+// call: since Velero calls Cancel() synchronously and only once, an unbounded
+// total (worst case: 3 attempts x apiCallTimeout each, plus backoff sleeps)
+// would leave that single call hanging far longer than a cancellation should
+// reasonably take.
+const cancelPatchTotalTimeout = 45 * time.Second
+
+// updateDataUpload patches the DataUpload's Spec.Cancel field in the cluster.
+// A scoped merge patch (rather than a full Update of the locally-fetched object)
+// is used deliberately: the kubevirt datamover controller concurrently
+// reconciles this same DataUpload and updates its Status via a full object
+// Update, so replacing the whole object from a possibly-stale local copy risks
+// clobbering the controller's in-flight status changes.
 func (p *BackupPlugin) updateDataUpload(du *velerov2alpha1.DataUpload) error {
 	config, err := clients.GetInClusterConfig()
 	if err != nil {
@@ -656,12 +779,14 @@ func (p *BackupPlugin) updateDataUpload(du *velerov2alpha1.DataUpload) error {
 		return fmt.Errorf("failed to get dynamic client: %w", err)
 	}
 
-	duMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(du)
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"cancel": du.Spec.Cancel,
+		},
+	})
 	if err != nil {
-		return fmt.Errorf("failed to convert DataUpload to unstructured: %w", err)
+		return fmt.Errorf("failed to build DataUpload cancel patch: %w", err)
 	}
-
-	unstructuredDU := &unstructured.Unstructured{Object: duMap}
 
 	gvr := schema.GroupVersionResource{
 		Group:    "velero.io",
@@ -669,13 +794,27 @@ func (p *BackupPlugin) updateDataUpload(du *velerov2alpha1.DataUpload) error {
 		Resource: "datauploads",
 	}
 
-	_, err = dynamicClient.Resource(gvr).Namespace(du.Namespace).Update(
-		context.Background(),
-		unstructuredDU,
-		metav1.UpdateOptions{},
-	)
-	if err != nil {
-		return fmt.Errorf("failed to update DataUpload: %w", err)
+	parentCtx, cancelParent := context.WithTimeout(context.Background(), cancelPatchTotalTimeout)
+	defer cancelParent()
+
+	retryErr := retry.OnError(cancelPatchBackoff, func(err error) bool {
+		// Retrying a not-found or invalid patch can't succeed; only retry
+		// errors that are plausibly transient (server hiccup, timeout, etc).
+		return !apierrors.IsNotFound(err) && !apierrors.IsInvalid(err)
+	}, func() error {
+		ctx, cancel := context.WithTimeout(parentCtx, apiCallTimeout)
+		defer cancel()
+		_, patchErr := dynamicClient.Resource(gvr).Namespace(du.Namespace).Patch(
+			ctx,
+			du.Name,
+			types.MergePatchType,
+			patch,
+			metav1.PatchOptions{},
+		)
+		return patchErr
+	})
+	if retryErr != nil {
+		return fmt.Errorf("failed to update DataUpload: %w", retryErr)
 	}
 
 	return nil
@@ -702,40 +841,109 @@ func buildDataUploadAnnotations(vm *kvcore.VirtualMachine, operationID string) m
 	return annotations
 }
 
-// generateOperationID creates a unique operation ID for tracking async operations.
+// hasOwnerUID reports whether any of ownerReferences has the given UID.
+// Used to confirm an adopted object actually belongs to the Backup being
+// processed, not to a prior object of the same name left behind by a
+// deleted-and-recreated Backup.
+func hasOwnerUID(ownerReferences []metav1.OwnerReference, uid types.UID) bool {
+	for _, ref := range ownerReferences {
+		if ref.UID == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// deterministicSuffix returns an 8-character hex digest of parts, joined by "/".
+// Used in place of a random UUID for names/IDs that must be stable across a
+// retried Execute() call for the same (backup, VM) pair: Velero may re-invoke
+// a BackupItemAction after a transient error, and a random suffix would make
+// each attempt mint a distinct DataUpload/operationID instead of converging
+// on the same one, defeating the AlreadyExists-based idempotency check below.
+func deterministicSuffix(parts ...string) string {
+	sum := sha256.Sum256([]byte(strings.Join(parts, "/")))
+	return hex.EncodeToString(sum[:4])
+}
+
+// generateOperationID creates a deterministic operation ID for tracking async
+// backup operations: the same (backupName, namespace, vmName) always yields
+// the same ID, so a retried Execute() call for the same item converges on the
+// same DataUpload's annotation rather than one Progress/Cancel can't find.
 func generateOperationID(backupName, namespace, vmName string) string {
-	return fmt.Sprintf("%s-%s-%s-%s", backupName, namespace, vmName, uuid.New().String()[:8])
+	return fmt.Sprintf("%s-%s-%s-%s", backupName, namespace, vmName, deterministicSuffix(backupName, namespace, vmName))
+}
+
+// distributeTruncationBudget returns, for each of parts, the max byte length
+// it may occupy so the sum is at most maxLen. Parts that already fit keep
+// their full length; any deficit is taken evenly off the longest part(s),
+// repeated until the total fits. Used instead of a fixed halfway split so the
+// same logic works regardless of how many name components are involved.
+func distributeTruncationBudget(maxLen int, parts []string) []int {
+	budgets := make([]int, len(parts))
+	for i, p := range parts {
+		budgets[i] = len(p)
+	}
+	for {
+		total := 0
+		for _, b := range budgets {
+			total += b
+		}
+		over := total - maxLen
+		if over <= 0 {
+			return budgets
+		}
+		largest := 0
+		for _, b := range budgets {
+			if b > largest {
+				largest = b
+			}
+		}
+		if largest == 0 {
+			return budgets
+		}
+		for i := range budgets {
+			if over <= 0 {
+				break
+			}
+			if budgets[i] == largest {
+				budgets[i]--
+				over--
+			}
+		}
+	}
 }
 
 // generateDataUploadName creates a name for the DataUpload CR.
-// The name format is: du-<backupName>-<vmName>-<uuid8>
-// If the total length exceeds 253 characters (Kubernetes limit),
-// the backupName and vmName are truncated while preserving the UUID suffix.
-func generateDataUploadName(backupName, vmName string) string {
-	uuidSuffix := uuid.New().String()[:8]
-	// Reserve space for: "du-" (3) + "-" (1) + "-" (1) + uuid (8) = 13 chars
-	const fixedLen = 13
-	maxBodyLen := 253 - fixedLen // 240 chars available for backupName + vmName
+// The name format is: du-<backupName>-<namespace>-<vmName>-<hash8>, where
+// hash8 is deterministic (see deterministicSuffix) rather than random, so a
+// retried Execute() call for the same (backup, namespace, VM) reproduces the
+// same name and Create() surfaces AlreadyExists instead of minting a
+// duplicate. namespace disambiguates same-named VMs backed up from different
+// namespaces within one backup -- without it, backupName+vmName alone would
+// collide for two such VMs even though they don't collide as Kubernetes
+// objects.
+// If the total length exceeds 253 characters (Kubernetes limit), the three
+// components are truncated (see distributeTruncationBudget) while preserving
+// the hash suffix.
+func generateDataUploadName(backupName, namespace, vmName string) string {
+	suffix := deterministicSuffix(backupName, namespace, vmName)
+	// Reserve space for: "du-" (3) + "-" + "-" + "-" (3) + hash (8) = 14 chars
+	const fixedLen = 14
+	maxBodyLen := 253 - fixedLen
 
-	// Truncate names if needed, preserving UUID for uniqueness
-	totalBodyLen := len(backupName) + len(vmName)
+	parts := []string{backupName, namespace, vmName}
+	totalBodyLen := len(backupName) + len(namespace) + len(vmName)
 	if totalBodyLen > maxBodyLen {
-		// Truncate proportionally, giving slight preference to backupName
-		halfMax := maxBodyLen / 2
-		if len(backupName) > halfMax && len(vmName) > halfMax {
-			// Both are long, truncate both
-			backupName = backupName[:halfMax]
-			vmName = vmName[:maxBodyLen-halfMax]
-		} else if len(backupName) > halfMax {
-			// Only backupName is long
-			backupName = backupName[:maxBodyLen-len(vmName)]
-		} else {
-			// Only vmName is long
-			vmName = vmName[:maxBodyLen-len(backupName)]
+		budgets := distributeTruncationBudget(maxBodyLen, parts)
+		for i, b := range budgets {
+			if b < len(parts[i]) {
+				parts[i] = strings.TrimRight(parts[i][:b], "-.")
+			}
 		}
+		backupName, namespace, vmName = parts[0], parts[1], parts[2]
 	}
 
-	return fmt.Sprintf("du-%s-%s-%s", backupName, vmName, uuidSuffix)
+	return fmt.Sprintf("du-%s-%s-%s-%s", backupName, namespace, vmName, suffix)
 }
 
 // getDynamicClient returns a dynamic client for working with unstructured resources.
