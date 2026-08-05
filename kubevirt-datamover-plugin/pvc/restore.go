@@ -614,6 +614,14 @@ var cancelPatchBackoff = wait.Backoff{
 	Jitter:   0.1,
 }
 
+// cancelPatchTotalTimeout bounds the entire updateDataDownload retry loop
+// (all attempts and backoff sleeps combined), not just each individual patch
+// call: since Velero calls Cancel() synchronously and only once, an unbounded
+// total (worst case: 3 attempts x apiCallTimeout each, plus backoff sleeps)
+// would leave that single call hanging far longer than a cancellation should
+// reasonably take.
+const cancelPatchTotalTimeout = 45 * time.Second
+
 // updateDataDownload patches the DataDownload's Spec.Cancel field in the cluster.
 // A scoped merge patch (rather than a full Update of the locally-fetched object) is
 // used deliberately: the kubevirt datamover controller concurrently reconciles this
@@ -646,12 +654,15 @@ func (p *RestorePlugin) updateDataDownload(dd *velerov2alpha1.DataDownload) erro
 		Resource: "datadownloads",
 	}
 
+	parentCtx, cancelParent := context.WithTimeout(context.Background(), cancelPatchTotalTimeout)
+	defer cancelParent()
+
 	retryErr := retry.OnError(cancelPatchBackoff, func(err error) bool {
 		// Retrying a not-found or invalid patch can't succeed; only retry
 		// errors that are plausibly transient (server hiccup, timeout, etc).
 		return !apierrors.IsNotFound(err) && !apierrors.IsInvalid(err)
 	}, func() error {
-		ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
+		ctx, cancel := context.WithTimeout(parentCtx, apiCallTimeout)
 		defer cancel()
 		_, patchErr := dynamicClient.Resource(gvr).Namespace(dd.Namespace).Patch(
 			ctx,
