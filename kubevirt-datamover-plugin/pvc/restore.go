@@ -175,7 +175,38 @@ func (p *RestorePlugin) Execute(input *velero.RestoreItemActionExecuteInput) (*v
 	// Velero to find. Velero's own built-in CSI PVC restore action follows the same
 	// rule: it leaves AdditionalItems empty for the DataDownload it creates, only
 	// populating it for the (unrelated) VolumeSnapshot restore path.
-	return velero.NewRestoreItemActionExecuteOutput(input.Item).WithOperationID(returnedOperationID), nil
+	updatedItem, err := clearPVCBinding(input.Item)
+	if err != nil {
+		return nil, err
+	}
+
+	return velero.NewRestoreItemActionExecuteOutput(updatedItem).WithOperationID(returnedOperationID), nil
+}
+
+// clearPVCBinding returns a copy of item with the binding-implying fields
+// cleared. The backed-up PVC was already bound to its pre-backup PV, but that
+// PV is not restored by this flow -- the datamover controller rebinds a new
+// scratch PV onto this PVC once the DataDownload completes. Leaving
+// Spec.VolumeName/Status.Phase intact would make Velero create the restored
+// PVC still carrying that stale binding, which the datamover controller's
+// handleAccepted rejects outright ("already bound or requests volume ...,
+// which conflicts with restore rebinding") since it can never safely rebind
+// an already-bound PVC. Velero's own built-in CSI PVC restore action clears
+// the same fields for the analogous reason.
+func clearPVCBinding(item runtime.Unstructured) (runtime.Unstructured, error) {
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(item.UnstructuredContent(), pvc); err != nil {
+		return nil, fmt.Errorf("failed to convert item to PersistentVolumeClaim: %w", err)
+	}
+
+	pvc.Spec.VolumeName = ""
+	pvc.Status = corev1.PersistentVolumeClaimStatus{}
+
+	pvcMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pvc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert PersistentVolumeClaim to unstructured: %w", err)
+	}
+	return &unstructured.Unstructured{Object: pvcMap}, nil
 }
 
 // Progress returns the progress of an async restore operation.
