@@ -197,13 +197,28 @@ func (p *RestorePlugin) Execute(input *velero.RestoreItemActionExecuteInput) (*v
 // an already-bound PVC. Velero's own built-in CSI PVC restore action clears
 // the same fields for the analogous reason.
 //
+// It also removes the two annotations the Kubernetes PV controller uses to
+// track that a binding was already completed (pv.kubernetes.io/bind-completed,
+// pv.kubernetes.io/bound-by-controller). Velero's own restore.go has a block
+// that does exactly this via resetVolumeBindingInfo -- but only when it sees
+// spec.volumeName still set on the item *after* every RestoreItemAction has
+// already run (vendored pkg/restore/restore.go: the PVC-specific block runs
+// after the action loop, gated on `if pvc.Spec.VolumeName != ""`). Since this
+// plugin clears volumeName earlier in that same loop, Velero's own gate never
+// fires for this PVC, so the annotations would otherwise survive onto the
+// restored object even though volumeName is gone -- leaving a PVC that looks
+// bound to the Kubernetes PV controller (per its own bookkeeping annotations)
+// but has no volume to point at, which the controller has no path to recover
+// from on its own. Clearing them here restores what Velero's own gate would
+// have done had this plugin not intercepted volumeName first.
+//
 // This operates on the raw unstructured content (via RemoveNestedField)
 // rather than round-tripping through a typed corev1.PersistentVolumeClaim:
 // a typed round-trip would silently drop any field the vendored corev1
 // type doesn't know about (e.g. a newer field from a cluster running a
 // later Kubernetes version than this plugin was built against), whereas
-// removing just the two fields that actually need clearing preserves
-// everything else exactly as Velero handed it to us.
+// removing just the fields that actually need clearing preserves everything
+// else exactly as Velero handed it to us.
 func clearPVCBinding(item runtime.Unstructured) (runtime.Unstructured, error) {
 	copied := item.DeepCopyObject()
 	cleaned, ok := copied.(runtime.Unstructured)
@@ -211,11 +226,25 @@ func clearPVCBinding(item runtime.Unstructured) (runtime.Unstructured, error) {
 		return nil, fmt.Errorf("failed to copy restore item: unexpected type %T", copied)
 	}
 
-	unstructured.RemoveNestedField(cleaned.UnstructuredContent(), "spec", "volumeName")
-	unstructured.RemoveNestedField(cleaned.UnstructuredContent(), "status")
+	content := cleaned.UnstructuredContent()
+	unstructured.RemoveNestedField(content, "spec", "volumeName")
+	unstructured.RemoveNestedField(content, "status")
+	unstructured.RemoveNestedField(content, "metadata", "annotations", kubeAnnBindCompleted)
+	unstructured.RemoveNestedField(content, "metadata", "annotations", kubeAnnBoundByController)
+	cleaned.SetUnstructuredContent(content)
 
 	return cleaned, nil
 }
+
+// The two annotations the Kubernetes PV controller sets on a PersistentVolumeClaim
+// once it has completed binding it to a PersistentVolume. Matches Velero's own
+// pkg/util/kube.KubeAnnBindCompleted/KubeAnnBoundByController constants -- hardcoded
+// here rather than imported to avoid pulling in that internal Velero package just
+// for two well-known, stable Kubernetes annotation key strings.
+const (
+	kubeAnnBindCompleted     = "pv.kubernetes.io/bind-completed"
+	kubeAnnBoundByController = "pv.kubernetes.io/bound-by-controller"
+)
 
 // Progress returns the progress of an async restore operation.
 // It monitors the DataDownload CR status to report progress.

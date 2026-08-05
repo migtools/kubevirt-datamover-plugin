@@ -323,6 +323,8 @@ func TestRestorePlugin_Execute_Eligible(t *testing.T) {
 func TestClearPVCBinding(t *testing.T) {
 	pvc := newRestorePVC(testOrigNamespace, testRestorePVCName, map[string]string{
 		controllercommon.AnnotationVMName: "my-vm",
+		kubeAnnBindCompleted:              "yes",
+		kubeAnnBoundByController:          "yes",
 	})
 	pvc.Spec.VolumeName = "pvc-original-pv"
 	pvc.Status = corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound}
@@ -345,6 +347,21 @@ func TestClearPVCBinding(t *testing.T) {
 	_, found, err = unstructured.NestedMap(cleaned.UnstructuredContent(), "status")
 	require.NoError(t, err)
 	assert.False(t, found, "status must be removed")
+
+	annotations, found, err := unstructured.NestedStringMap(cleaned.UnstructuredContent(), "metadata", "annotations")
+	require.NoError(t, err)
+	require.True(t, found)
+	// Velero's own restore.go only strips these two PV-controller bookkeeping
+	// annotations when it sees spec.volumeName still set *after* every
+	// RestoreItemAction has run -- since this plugin clears volumeName
+	// earlier in that same loop, that gate never fires for this PVC, so
+	// clearPVCBinding must strip them itself or they'd survive onto a PVC
+	// that otherwise looks completely unbound.
+	_, present := annotations[kubeAnnBindCompleted]
+	assert.False(t, present, "pv.kubernetes.io/bind-completed must be removed")
+	_, present = annotations[kubeAnnBoundByController]
+	assert.False(t, present, "pv.kubernetes.io/bound-by-controller must be removed")
+	assert.Equal(t, "my-vm", annotations[controllercommon.AnnotationVMName], "unrelated annotations must survive")
 
 	futureField, found, err := unstructured.NestedString(cleaned.UnstructuredContent(), "spec", "someFutureField")
 	require.NoError(t, err)
