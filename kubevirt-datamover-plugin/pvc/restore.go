@@ -137,6 +137,14 @@ func (p *RestorePlugin) Execute(input *velero.RestoreItemActionExecuteInput) (*v
 		targetNamespace = mapped
 	}
 
+	// Computed before any cluster-mutating call below so a conversion failure
+	// here can't leave an already-created DataDownload behind with no
+	// OperationID for Velero to ever track or retry.
+	updatedItem, err := clearPVCBinding(input.Item)
+	if err != nil {
+		return nil, err
+	}
+
 	backup, err := p.getBackup(restore)
 	if err != nil {
 		return nil, err
@@ -175,11 +183,6 @@ func (p *RestorePlugin) Execute(input *velero.RestoreItemActionExecuteInput) (*v
 	// Velero to find. Velero's own built-in CSI PVC restore action follows the same
 	// rule: it leaves AdditionalItems empty for the DataDownload it creates, only
 	// populating it for the (unrelated) VolumeSnapshot restore path.
-	updatedItem, err := clearPVCBinding(input.Item)
-	if err != nil {
-		return nil, err
-	}
-
 	return velero.NewRestoreItemActionExecuteOutput(updatedItem).WithOperationID(returnedOperationID), nil
 }
 
