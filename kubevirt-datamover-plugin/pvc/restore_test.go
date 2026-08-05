@@ -71,7 +71,7 @@ func withFakeDynamicClient(t *testing.T, fakeDynamic *dynamicfake.FakeDynamicCli
 	SetDynamicClientFunc(func(config interface{}) (dynamicClientInterface, error) {
 		return fakeDynamic, nil
 	})
-	t.Cleanup(func() { getDynamicClient = original })
+	t.Cleanup(func() { SetDynamicClientFunc(original) })
 
 	clients.SetInClusterConfig(&rest.Config{Host: "https://fake"})
 	t.Cleanup(func() { clients.SetInClusterConfig(nil) })

@@ -542,7 +542,7 @@ func withFakeDynamicClient(t *testing.T, fakeDynamic *dynamicfake.FakeDynamicCli
 	SetDynamicClientFunc(func(config interface{}) (dynamicClientInterface, error) {
 		return fakeDynamic, nil
 	})
-	t.Cleanup(func() { getDynamicClient = original })
+	t.Cleanup(func() { SetDynamicClientFunc(original) })
 
 	clients.SetInClusterConfig(&rest.Config{Host: "https://fake"})
 	t.Cleanup(func() { clients.SetInClusterConfig(nil) })
@@ -863,7 +863,11 @@ func TestBackupPlugin_Cancel(t *testing.T) {
 				controllercommon.AnnotationOperationID: operationID,
 			},
 		},
-		Spec: velerov2alpha1.DataUploadSpec{Cancel: false},
+		Spec: velerov2alpha1.DataUploadSpec{Cancel: false, BackupStorageLocation: "my-bsl"},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase:   velerov2alpha1.DataUploadPhaseInProgress,
+			Message: "controller-owned status",
+		},
 	}
 
 	// A decoy DataUpload sharing the same backup label (as a second VM backed up
@@ -898,6 +902,11 @@ func TestBackupPlugin_Cancel(t *testing.T) {
 	updatedDU := &velerov2alpha1.DataUpload{}
 	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(updated.Object, updatedDU))
 	assert.True(t, updatedDU.Spec.Cancel)
+	assert.Equal(t, "my-bsl", updatedDU.Spec.BackupStorageLocation,
+		"Cancel must patch only spec.cancel and must not clobber other spec fields")
+	assert.Equal(t, velerov2alpha1.DataUploadPhaseInProgress, updatedDU.Status.Phase,
+		"Cancel must patch only spec.cancel and must not clobber the controller-owned Status")
+	assert.Equal(t, "controller-owned status", updatedDU.Status.Message)
 
 	decoyAfter, err := fakeDynamic.Resource(gvr).Namespace(backup.Namespace).Get(context.Background(), "du-cancel-decoy", metav1.GetOptions{})
 	require.NoError(t, err)
