@@ -690,6 +690,266 @@ func TestRestorePlugin_Execute_AlreadyExists_NamespaceMismatch(t *testing.T) {
 	assert.Contains(t, err.Error(), "some-other-ns")
 }
 
+func TestRestorePlugin_Execute_AlreadyExists_OwnerUIDMismatch(t *testing.T) {
+	const pvcName = testRestorePVCName
+
+	existingName := generateDataDownloadName(testRestoreName, testOrigNamespace, pvcName)
+
+	// Everything else matches, but the object's owner reference belongs to a
+	// prior Restore of the same name that was deleted and recreated.
+	existing := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            existingName,
+			Namespace:       testVeleroNS,
+			OwnerReferences: []metav1.OwnerReference{{UID: "stale-restore-uid"}},
+		},
+		Spec: velerov2alpha1.DataDownloadSpec{
+			TargetVolume: velerov2alpha1.TargetVolumeSpec{
+				PVC:       pvcName,
+				Namespace: testOrigNamespace,
+			},
+		},
+	}
+
+	fakeDynamic := newDataDownloadDynamicClient(t, dataDownloadUnstructured(t, existing))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testOrigBackupName, Namespace: testVeleroNS},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	fakeCRClient := getFakeCRClient(t, backup)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
+	require.NoError(t, err)
+
+	pvc := newRestorePVC(testOrigNamespace, pvcName, map[string]string{
+		controllercommon.AnnotationVMName: "my-vm",
+	})
+	pvcItem := restorePVCToUnstructured(t, pvc)
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS, UID: "current-restore-uid"},
+		Spec:       velerov1.RestoreSpec{BackupName: testOrigBackupName},
+	}
+
+	_, err = plugin.Execute(&velero.RestoreItemActionExecuteInput{
+		Item:           pvcItem,
+		ItemFromBackup: pvcItem,
+		Restore:        restore,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is not owned by Restore")
+}
+
+func TestRestorePlugin_Execute_AlreadyExists_SourceIdentityMismatch(t *testing.T) {
+	const pvcName = testRestorePVCName
+
+	existingName := generateDataDownloadName(testRestoreName, testOrigNamespace, pvcName)
+
+	// TargetVolume and owner match, but the object's source namespace/VM
+	// annotations point at a different VM -- must not be silently reused.
+	existing := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      existingName,
+			Namespace: testVeleroNS,
+			Annotations: map[string]string{
+				controllercommon.AnnotationVMName:      "some-other-vm",
+				controllercommon.AnnotationVMNamespace: testOrigNamespace,
+			},
+			OwnerReferences: []metav1.OwnerReference{{UID: "restore-uid"}},
+		},
+		Spec: velerov2alpha1.DataDownloadSpec{
+			SourceNamespace: testOrigNamespace,
+			TargetVolume: velerov2alpha1.TargetVolumeSpec{
+				PVC:       pvcName,
+				Namespace: testOrigNamespace,
+			},
+		},
+	}
+
+	fakeDynamic := newDataDownloadDynamicClient(t, dataDownloadUnstructured(t, existing))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testOrigBackupName, Namespace: testVeleroNS},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	fakeCRClient := getFakeCRClient(t, backup)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
+	require.NoError(t, err)
+
+	pvc := newRestorePVC(testOrigNamespace, pvcName, map[string]string{
+		controllercommon.AnnotationVMName: "my-vm",
+	})
+	pvcItem := restorePVCToUnstructured(t, pvc)
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS, UID: "restore-uid"},
+		Spec:       velerov1.RestoreSpec{BackupName: testOrigBackupName},
+	}
+
+	_, err = plugin.Execute(&velero.RestoreItemActionExecuteInput{
+		Item:           pvcItem,
+		ItemFromBackup: pvcItem,
+		Restore:        restore,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "some-other-vm")
+	assert.Contains(t, err.Error(), "refusing to reuse")
+}
+
+func TestRestorePlugin_Execute_AlreadyExists_DataMoverMismatch(t *testing.T) {
+	const pvcName = testRestorePVCName
+
+	existingName := generateDataDownloadName(testRestoreName, testOrigNamespace, pvcName)
+
+	existing := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      existingName,
+			Namespace: testVeleroNS,
+			Annotations: map[string]string{
+				controllercommon.AnnotationVMName:      "my-vm",
+				controllercommon.AnnotationVMNamespace: testOrigNamespace,
+			},
+			OwnerReferences: []metav1.OwnerReference{{UID: "restore-uid"}},
+		},
+		Spec: velerov2alpha1.DataDownloadSpec{
+			DataMover:       "some-other-datamover",
+			SourceNamespace: testOrigNamespace,
+			TargetVolume: velerov2alpha1.TargetVolumeSpec{
+				PVC:       pvcName,
+				Namespace: testOrigNamespace,
+			},
+		},
+	}
+
+	fakeDynamic := newDataDownloadDynamicClient(t, dataDownloadUnstructured(t, existing))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testOrigBackupName, Namespace: testVeleroNS},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	fakeCRClient := getFakeCRClient(t, backup)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
+	require.NoError(t, err)
+
+	pvc := newRestorePVC(testOrigNamespace, pvcName, map[string]string{
+		controllercommon.AnnotationVMName: "my-vm",
+	})
+	pvcItem := restorePVCToUnstructured(t, pvc)
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS, UID: "restore-uid"},
+		Spec:       velerov1.RestoreSpec{BackupName: testOrigBackupName},
+	}
+
+	_, err = plugin.Execute(&velero.RestoreItemActionExecuteInput{
+		Item:           pvcItem,
+		ItemFromBackup: pvcItem,
+		Restore:        restore,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "some-other-datamover")
+}
+
+func TestRestorePlugin_Execute_AlreadyExists_BackupStorageLocationMismatch(t *testing.T) {
+	const pvcName = testRestorePVCName
+
+	existingName := generateDataDownloadName(testRestoreName, testOrigNamespace, pvcName)
+
+	existing := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      existingName,
+			Namespace: testVeleroNS,
+			Annotations: map[string]string{
+				controllercommon.AnnotationVMName:      "my-vm",
+				controllercommon.AnnotationVMNamespace: testOrigNamespace,
+			},
+			OwnerReferences: []metav1.OwnerReference{{UID: "restore-uid"}},
+		},
+		Spec: velerov2alpha1.DataDownloadSpec{
+			DataMover:             controllercommon.DataMoverKubeVirt,
+			BackupStorageLocation: "some-other-bsl",
+			SourceNamespace:       testOrigNamespace,
+			TargetVolume: velerov2alpha1.TargetVolumeSpec{
+				PVC:       pvcName,
+				Namespace: testOrigNamespace,
+			},
+		},
+	}
+
+	fakeDynamic := newDataDownloadDynamicClient(t, dataDownloadUnstructured(t, existing))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testOrigBackupName, Namespace: testVeleroNS},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	fakeCRClient := getFakeCRClient(t, backup)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
+	require.NoError(t, err)
+
+	pvc := newRestorePVC(testOrigNamespace, pvcName, map[string]string{
+		controllercommon.AnnotationVMName: "my-vm",
+	})
+	pvcItem := restorePVCToUnstructured(t, pvc)
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS, UID: "restore-uid"},
+		Spec:       velerov1.RestoreSpec{BackupName: testOrigBackupName},
+	}
+
+	_, err = plugin.Execute(&velero.RestoreItemActionExecuteInput{
+		Item:           pvcItem,
+		ItemFromBackup: pvcItem,
+		Restore:        restore,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "some-other-bsl")
+}
+
+func TestRestorePlugin_Execute_AlreadyExists_RefetchError(t *testing.T) {
+	const pvcName = testRestorePVCName
+
+	existingName := generateDataDownloadName(testRestoreName, testOrigNamespace, pvcName)
+	existing := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{Name: existingName, Namespace: testVeleroNS},
+	}
+
+	fakeDynamic := newDataDownloadDynamicClient(t, dataDownloadUnstructured(t, existing))
+	fakeDynamic.PrependReactor("get", "datadownloads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("simulated get failure")
+	})
+	withFakeDynamicClient(t, fakeDynamic)
+
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testOrigBackupName, Namespace: testVeleroNS},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	fakeCRClient := getFakeCRClient(t, backup)
+	plugin, err := NewRestorePlugin(newTestLogger(), fakeCRClient)
+	require.NoError(t, err)
+
+	pvc := newRestorePVC(testOrigNamespace, pvcName, map[string]string{
+		controllercommon.AnnotationVMName: "my-vm",
+	})
+	pvcItem := restorePVCToUnstructured(t, pvc)
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS, UID: "restore-uid"},
+		Spec:       velerov1.RestoreSpec{BackupName: testOrigBackupName},
+	}
+
+	_, err = plugin.Execute(&velero.RestoreItemActionExecuteInput{
+		Item:           pvcItem,
+		ItemFromBackup: pvcItem,
+		Restore:        restore,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "could not be re-fetched")
+}
+
 func TestRestorePlugin_Execute_AlreadyExists_MissingOperationIDAnnotation(t *testing.T) {
 	const pvcName = testRestorePVCName
 
