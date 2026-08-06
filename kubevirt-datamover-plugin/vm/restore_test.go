@@ -244,6 +244,7 @@ func TestHaltVM_PreservesUnknownFields(t *testing.T) {
 	vmObj := newRestoreTestVM(testNamespace, testRestoreVMName, map[string]string{"some-annotation": "keep-me"})
 	item := vmToUnstructured(t, vmObj)
 	require.NoError(t, unstructured.SetNestedField(item.UnstructuredContent(), "some-value", "spec", "someFutureField"))
+	originalItem := item.DeepCopyObject().(runtime.Unstructured)
 
 	cleaned, err := haltVM(item, runStrategySourceRunStrategy, string(kvcore.RunStrategyAlways))
 	require.NoError(t, err)
@@ -257,9 +258,7 @@ func TestHaltVM_PreservesUnknownFields(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "keep-me", annotations["some-annotation"], "unrelated annotations must survive")
 
-	_, found, err = unstructured.NestedString(item.UnstructuredContent(), "spec", "runStrategy")
-	require.NoError(t, err)
-	assert.False(t, found, "haltVM must not mutate the passed-in item")
+	assert.Equal(t, originalItem, item, "haltVM must not mutate the passed-in item")
 }
 
 type nonUnstructuredCopyVMItem struct {
@@ -588,6 +587,26 @@ func TestVMRestorePlugin_Cancel_NoDataDownloads(t *testing.T) {
 
 	err := plugin.Cancel(operationID, restore)
 	assert.NoError(t, err)
+}
+
+func TestVMRestorePlugin_Cancel_ListError(t *testing.T) {
+	fakeDynamic := newDataUploadDynamicClient(t)
+	fakeDynamic.PrependReactor("list", "datadownloads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("simulated list failure")
+	})
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := NewRestorePlugin(newTestLogger())
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName2, Namespace: "velero"},
+		Spec:       velerov1.RestoreSpec{BackupName: testBackupName},
+	}
+	operationID := generateVMRestoreOperationID(testRestoreName2, testNamespace, testRestoreVMName)
+
+	err := plugin.Cancel(operationID, restore)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to get DataDownloads for cancellation")
 }
 
 func TestVMRestorePlugin_Cancel_PatchesOnlyMatchingVM(t *testing.T) {

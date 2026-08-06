@@ -316,8 +316,12 @@ func (p *RestorePlugin) Progress(operationID string, restore *velerov1.Restore) 
 			time.Since(start.Time) > firstDataDownloadGracePeriod {
 			progress.Completed = true
 			progress.Err = fmt.Sprintf(
-				"no kubevirt datamover DataDownload appeared for VM %s/%s within %s of restore start",
-				namespace, vmName, firstDataDownloadGracePeriod)
+				"no kubevirt datamover DataDownload appeared for VM %s/%s within %s of restore start; "+
+					"this plugin halted the VM and it will not start automatically -- if the "+
+					"kubevirt-datamover-controller does not reconcile it, restore its run state "+
+					"manually from the %s/%s annotations on the VM",
+				namespace, vmName, firstDataDownloadGracePeriod, AnnotationOriginalRunStrategySource, AnnotationOriginalRunStrategy)
+			p.Log.Errorf("[vm-restore] %s", progress.Err)
 			return progress, nil
 		}
 		progress.Description = "Waiting for kubevirt datamover DataDownload(s) to appear for this VM"
