@@ -218,6 +218,10 @@ func TestVMRestorePlugin_Execute_HaltsDeprecatedRunningBool(t *testing.T) {
 	require.True(t, found)
 	assert.Equal(t, string(kvcore.RunStrategyHalted), runStrategy)
 
+	_, found, err = unstructured.NestedBool(content, "spec", "running")
+	require.NoError(t, err)
+	assert.False(t, found, "spec.running must be removed so it cannot conflict with spec.runStrategy")
+
 	source, found, err := unstructured.NestedString(content, "metadata", "annotations", AnnotationOriginalRunStrategySource)
 	require.NoError(t, err)
 	require.True(t, found)
@@ -389,15 +393,24 @@ func TestVMRestorePlugin_Progress_Aggregation(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			var objs []runtime.Object
+			var wantTotal, wantDone int64
 			for i, phase := range tc.phases {
 				dd := newTestDataDownload(
 					"dd-vm-progress", "velero", testBackupName, testRestoreName2, testNamespace, testRestoreVMName, phase)
 				dd.Name = dd.Name + string(rune('a'+i))
+				dd.Status.Progress.TotalBytes = int64(100 * (i + 1))
+				dd.Status.Progress.BytesDone = int64(50 * (i + 1))
+				wantTotal += dd.Status.Progress.TotalBytes
+				wantDone += dd.Status.Progress.BytesDone
 				objs = append(objs, dataDownloadUnstructured(t, dd))
 			}
 			// Decoy DataDownload for a different VM in the same restore: must not
-			// affect this VM's aggregation.
+			// affect this VM's aggregation. Its byte counts are deliberately far
+			// outside the matching entries' range, so accidentally including it
+			// would be obvious in the assertions below.
 			decoy := newTestDataDownload("dd-decoy", "velero", testBackupName, testRestoreName2, testNamespace, "some-other-vm", velerov2alpha1.DataDownloadPhaseInProgress)
+			decoy.Status.Progress.TotalBytes = 987654
+			decoy.Status.Progress.BytesDone = 123456
 			objs = append(objs, dataDownloadUnstructured(t, decoy))
 
 			fakeDynamic := newDataUploadDynamicClient(t, objs...)
@@ -414,6 +427,8 @@ func TestVMRestorePlugin_Progress_Aggregation(t *testing.T) {
 
 			require.NoError(t, err)
 			assert.Equal(t, tc.expectedCompleted, progress.Completed)
+			assert.Equal(t, wantTotal, progress.NTotal, "NTotal must sum only this VM's matching DataDownloads, excluding the decoy")
+			assert.Equal(t, wantDone, progress.NCompleted, "NCompleted must sum only this VM's matching DataDownloads, excluding the decoy")
 			if tc.expectErr {
 				assert.NotEmpty(t, progress.Err)
 			} else {
