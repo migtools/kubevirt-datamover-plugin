@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,6 +29,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
@@ -375,6 +378,8 @@ func TestVMRestorePlugin_Progress_NoDataDownloadsYet(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.False(t, progress.Completed, "an empty list means the sibling PVC plugin hasn't created the DataDownload(s) yet, not that none will ever exist")
+	assert.Equal(t, "Waiting for kubevirt datamover DataDownload(s) to appear for this VM", progress.Description)
+	assert.Empty(t, progress.Err)
 }
 
 func TestVMRestorePlugin_Progress_Aggregation(t *testing.T) {
@@ -394,23 +399,35 @@ func TestVMRestorePlugin_Progress_Aggregation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var objs []runtime.Object
 			var wantTotal, wantDone int64
+			base := metav1.NewTime(time.Now().Truncate(time.Second))
+			var wantEarliest time.Time
 			for i, phase := range tc.phases {
 				dd := newTestDataDownload(
 					"dd-vm-progress", "velero", testBackupName, testRestoreName2, testNamespace, testRestoreVMName, phase)
 				dd.Name = dd.Name + string(rune('a'+i))
 				dd.Status.Progress.TotalBytes = int64(100 * (i + 1))
 				dd.Status.Progress.BytesDone = int64(50 * (i + 1))
+				// Later entries start later, so the first entry is always the
+				// earliest -- tests that progress.Started picks the minimum
+				// across all matching DataDownloads, not just the last one seen.
+				started := metav1.NewTime(base.Add(time.Duration(i) * time.Minute))
+				dd.Status.StartTimestamp = &started
+				if wantEarliest.IsZero() || started.Time.Before(wantEarliest) {
+					wantEarliest = started.Time
+				}
 				wantTotal += dd.Status.Progress.TotalBytes
 				wantDone += dd.Status.Progress.BytesDone
 				objs = append(objs, dataDownloadUnstructured(t, dd))
 			}
 			// Decoy DataDownload for a different VM in the same restore: must not
-			// affect this VM's aggregation. Its byte counts are deliberately far
-			// outside the matching entries' range, so accidentally including it
-			// would be obvious in the assertions below.
+			// affect this VM's aggregation. Its byte counts and start time are
+			// deliberately far outside the matching entries' range, so
+			// accidentally including it would be obvious in the assertions below.
 			decoy := newTestDataDownload("dd-decoy", "velero", testBackupName, testRestoreName2, testNamespace, "some-other-vm", velerov2alpha1.DataDownloadPhaseInProgress)
 			decoy.Status.Progress.TotalBytes = 987654
 			decoy.Status.Progress.BytesDone = 123456
+			decoyStarted := metav1.NewTime(base.Add(-time.Hour))
+			decoy.Status.StartTimestamp = &decoyStarted
 			objs = append(objs, dataDownloadUnstructured(t, decoy))
 
 			fakeDynamic := newDataUploadDynamicClient(t, objs...)
@@ -429,6 +446,7 @@ func TestVMRestorePlugin_Progress_Aggregation(t *testing.T) {
 			assert.Equal(t, tc.expectedCompleted, progress.Completed)
 			assert.Equal(t, wantTotal, progress.NTotal, "NTotal must sum only this VM's matching DataDownloads, excluding the decoy")
 			assert.Equal(t, wantDone, progress.NCompleted, "NCompleted must sum only this VM's matching DataDownloads, excluding the decoy")
+			assert.True(t, progress.Started.Equal(wantEarliest), "Started must be the earliest StartTimestamp among this VM's matching DataDownloads, excluding the decoy")
 			if tc.expectErr {
 				assert.NotEmpty(t, progress.Err)
 			} else {
@@ -524,6 +542,28 @@ func TestVMRestorePlugin_Cancel_AttemptsAllAndAggregatesErrors(t *testing.T) {
 	updatedOKDD := &velerov2alpha1.DataDownload{}
 	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(updatedOK.Object, updatedOKDD))
 	assert.True(t, updatedOKDD.Spec.Cancel, "Cancel must still patch the other sibling DataDownload even though one patch failed")
+}
+
+func TestVMRestorePlugin_Cancel_AlreadyGoneIsNotAnError(t *testing.T) {
+	withFastCancelBackoff(t)
+
+	dd := newTestDataDownload("dd-vm-cancel-gone", "velero", testBackupName, testRestoreName2, testNamespace, testRestoreVMName, velerov2alpha1.DataDownloadPhaseInProgress)
+
+	fakeDynamic := newDataUploadDynamicClient(t, dataDownloadUnstructured(t, dd))
+	fakeDynamic.PrependReactor("patch", "datadownloads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: "velero.io", Resource: "datadownloads"}, dd.Name)
+	})
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := NewRestorePlugin(newTestLogger())
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName2, Namespace: "velero"},
+		Spec:       velerov1.RestoreSpec{BackupName: testBackupName},
+	}
+	operationID := generateVMRestoreOperationID(testRestoreName2, testNamespace, testRestoreVMName)
+
+	err := plugin.Cancel(operationID, restore)
+	assert.NoError(t, err, "a DataDownload that's already gone (e.g. completed and garbage-collected concurrently) has nothing left to cancel")
 }
 
 func TestVMRestorePlugin_AreAdditionalItemsReady(t *testing.T) {
