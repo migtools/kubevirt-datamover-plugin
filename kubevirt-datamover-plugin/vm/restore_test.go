@@ -132,6 +132,7 @@ func TestVMRestorePlugin_Execute_NotAutoStarting(t *testing.T) {
 	}{
 		{name: "RunStrategyHalted", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.RunStrategy = ptr.To(kvcore.RunStrategyHalted) }},
 		{name: "RunStrategyManual", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.RunStrategy = ptr.To(kvcore.RunStrategyManual) }},
+		{name: "RunStrategyWaitAsReceiver", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.RunStrategy = ptr.To(kvcore.RunStrategyWaitAsReceiver) }},
 		{name: "Running=false", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.Running = ptr.To(false) }},
 		{name: "neither field set", mod: func(vm *kvcore.VirtualMachine) {}},
 	}
@@ -207,6 +208,7 @@ func TestVMRestorePlugin_Execute_HaltsDeprecatedRunningBool(t *testing.T) {
 	vmObj := newRestoreTestVM(testNamespace, testRestoreVMName, datamoverAnnotations(nil))
 	vmObj.Spec.Running = ptr.To(true)
 	vmItem := vmToUnstructured(t, vmObj)
+	originalItem := vmItem.DeepCopyObject().(runtime.Unstructured)
 
 	restore := &velerov1.Restore{ObjectMeta: metav1.ObjectMeta{Name: testRestoreName2, Namespace: "velero"}}
 
@@ -214,6 +216,7 @@ func TestVMRestorePlugin_Execute_HaltsDeprecatedRunningBool(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, output)
+	assert.Equal(t, originalItem, vmItem, "Execute must not mutate the passed-in Item")
 	assert.NotEmpty(t, output.OperationID)
 
 	content := output.UpdatedItem.UnstructuredContent()
@@ -328,11 +331,21 @@ func TestGenerateAndParseVMRestoreOperationID(t *testing.T) {
 		"the operation ID must be deterministic so it survives a Velero server restart mid-restore")
 	assert.NotEqual(t, id, generateVMRestoreOperationID(testRestoreName2, testNamespace, "other-vm"),
 		"distinct VMs in one restore must get distinct operation IDs")
+	assert.NotEqual(t, id, generateVMRestoreOperationID(testRestoreName2, "other-namespace", testRestoreVMName),
+		"the same VM name in distinct namespaces must get distinct operation IDs")
 
 	namespace, vmName, err := parseVMRestoreOperationID(id, testRestoreName2)
 	require.NoError(t, err)
 	assert.Equal(t, testNamespace, namespace)
 	assert.Equal(t, testRestoreVMName, vmName)
+
+	// Namespace/VM names may legally contain "-", the delimiter used
+	// elsewhere for opaque IDs -- confirm "/" splitting isn't confused by it.
+	trickyID := generateVMRestoreOperationID(testRestoreName2, "ns-with-dashes", "vm-with-dashes.and.dots")
+	trickyNS, trickyVM, err := parseVMRestoreOperationID(trickyID, testRestoreName2)
+	require.NoError(t, err)
+	assert.Equal(t, "ns-with-dashes", trickyNS)
+	assert.Equal(t, "vm-with-dashes.and.dots", trickyVM)
 
 	_, _, err = parseVMRestoreOperationID(id, "some-other-restore")
 	require.Error(t, err)

@@ -277,6 +277,12 @@ func (p *RestorePlugin) Progress(operationID string, restore *velerov1.Restore) 
 		Started:        time.Now(),
 		Updated:        time.Now(),
 	}
+	if start := restore.Status.StartTimestamp; start != nil {
+		// Anchor Started to the restore's own start time by default, so it
+		// doesn't drift forward on every poll before any DataDownload has
+		// reported its own (generally earlier) StartTimestamp below.
+		progress.Started = start.Time
+	}
 
 	namespace, vmName, err := parseVMRestoreOperationID(operationID, restore.Name)
 	if err != nil {
