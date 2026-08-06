@@ -510,6 +510,12 @@ func (p *RestorePlugin) patchDataDownloadCancel(dynamicClient dynamicClientInter
 	defer cancelParent()
 
 	retryErr := retry.OnError(cancelPatchBackoff, func(err error) bool {
+		if parentCtx.Err() != nil {
+			// The overall cancelPatchTotalTimeout has elapsed: further
+			// attempts would just fail on an already-canceled context, so
+			// stop instead of burning the rest of the backoff schedule.
+			return false
+		}
 		return !apierrors.IsNotFound(err) && !apierrors.IsInvalid(err)
 	}, func() error {
 		ctx, cancel := context.WithTimeout(parentCtx, apiCallTimeout)
@@ -529,7 +535,7 @@ func (p *RestorePlugin) patchDataDownloadCancel(dynamicClient dynamicClientInter
 			// nothing left to cancel, not a failure.
 			return nil
 		}
-		return fmt.Errorf("failed to update DataDownload: %w", retryErr)
+		return fmt.Errorf("failed to patch DataDownload spec.cancel: %w", retryErr)
 	}
 
 	return nil
