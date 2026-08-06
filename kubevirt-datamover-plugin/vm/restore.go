@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -68,15 +69,31 @@ var dataDownloadGVR = schema.GroupVersionResource{
 	Resource: "datadownloads",
 }
 
-// firstDataDownloadGracePeriod bounds how long Progress will wait, from the
-// restore's own start time, for this VM's first sibling DataDownload to
-// appear before giving up. An empty list usually just means the sibling PVC
-// plugin hasn't gotten to this VM's PVCs yet, but it can also mean none of
-// them ended up in this restore at all (e.g. excluded by resource/namespace
-// filtering) -- in which case no DataDownload will ever appear, and waiting
-// out Velero's own (much longer) per-operation timeout instead would delay
-// surfacing that failure far more than necessary.
+// firstDataDownloadGracePeriod bounds how long Progress will wait, per
+// operation, for this VM's first sibling DataDownload to appear before
+// giving up. An empty list usually just means the sibling PVC plugin hasn't
+// gotten to this VM's PVCs yet, but it can also mean none of them ended up
+// in this restore at all (e.g. excluded by resource/namespace filtering) --
+// in which case no DataDownload will ever appear, and waiting out Velero's
+// own (much longer) per-operation timeout instead would delay surfacing
+// that failure far more than necessary.
 const firstDataDownloadGracePeriod = 10 * time.Minute
+
+// firstEmptyObservedAt tracks, per operation ID, the first time Progress
+// observed zero sibling DataDownloads for that VM -- the anchor
+// firstDataDownloadGracePeriod is measured from. This is deliberately not
+// restore.Status.StartTimestamp: on a large restore where this VM's
+// Execute() doesn't run until well into the restore's overall lifetime,
+// anchoring to the restore's start could leave little or none of the grace
+// period by the time Progress is first polled for this VM specifically.
+//
+// Keyed by operation ID at package level, not held on RestorePlugin: entries
+// must survive regardless of whether Velero's plugin framework reuses one
+// RestorePlugin instance across calls or constructs a fresh one per RPC.
+// A Velero server restart resets this map -- fail-safe, since that only
+// extends the effective grace period for any operation already waiting, it
+// never shortens it.
+var firstEmptyObservedAt sync.Map // operationID string -> time.Time
 
 // newDataDownloadClient builds a dynamic client for DataDownload access.
 // Callers that need more than one DataDownload API call within a single
@@ -310,13 +327,15 @@ func (p *RestorePlugin) Progress(operationID string, restore *velerov1.Restore) 
 		// time -- so an empty list here usually means "not created yet".
 		// It can also mean this VM's PVCs never made it into the restore
 		// at all, in which case no DataDownload will ever appear -- so
-		// bound the wait by the restore's own start time instead of
-		// relying solely on Velero's much longer per-operation timeout.
-		if start := restore.Status.StartTimestamp; start != nil &&
-			time.Since(start.Time) > firstDataDownloadGracePeriod {
+		// bound the wait from when this operation first saw an empty list,
+		// instead of relying solely on Velero's much longer per-operation
+		// timeout.
+		firstSeen, _ := firstEmptyObservedAt.LoadOrStore(operationID, time.Now())
+		if time.Since(firstSeen.(time.Time)) > firstDataDownloadGracePeriod {
+			firstEmptyObservedAt.Delete(operationID)
 			progress.Completed = true
 			progress.Err = fmt.Sprintf(
-				"no kubevirt datamover DataDownload appeared for VM %s/%s within %s of restore start; "+
+				"no kubevirt datamover DataDownload appeared for VM %s/%s within %s of first observing none; "+
 					"this plugin halted the VM and it will not start automatically -- if the "+
 					"kubevirt-datamover-controller does not reconcile it, restore its run state "+
 					"manually from the %s/%s annotations on the VM",
@@ -327,6 +346,11 @@ func (p *RestorePlugin) Progress(operationID string, restore *velerov1.Restore) 
 		progress.Description = "Waiting for kubevirt datamover DataDownload(s) to appear for this VM"
 		return progress, nil
 	}
+
+	// At least one DataDownload now exists for this operation: any grace-
+	// period tracking entry from an earlier empty-list poll is no longer
+	// needed.
+	firstEmptyObservedAt.Delete(operationID)
 
 	allCompleted := true
 	var totalBytes, doneBytes int64
@@ -398,6 +422,11 @@ func (p *RestorePlugin) Cancel(operationID string, restore *velerov1.Restore) er
 	if err != nil {
 		return err
 	}
+
+	// This operation is being torn down regardless of outcome below, so any
+	// grace-period tracking entry from a prior empty-list Progress poll is
+	// no longer relevant.
+	firstEmptyObservedAt.Delete(operationID)
 
 	dynamicClient, err := newDataDownloadClient()
 	if err != nil {
