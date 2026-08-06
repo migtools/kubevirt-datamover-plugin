@@ -378,6 +378,47 @@ func TestClearPVCBinding(t *testing.T) {
 	assert.True(t, found, "clearPVCBinding must not mutate the passed-in item")
 }
 
+// TestClearPVCBinding_LeavesSelectorUntouched documents current behavior:
+// clearPVCBinding does not clear/reset spec.selector. This is believed safe
+// because spec.selector is only meaningful for a PVC statically pre-bound to
+// an existing PV by label match; a kubevirt-datamover-backed PVC is always
+// dynamically provisioned via a StorageClass and so never has spec.selector
+// set to begin with, making a reset moot. If that assumption is ever wrong
+// for some PVC, this test pins today's actual (not just intended) behavior:
+// whatever was in spec.selector survives clearPVCBinding unchanged.
+func TestClearPVCBinding_LeavesSelectorUntouched(t *testing.T) {
+	testCases := []struct {
+		name     string
+		selector *metav1.LabelSelector
+	}{
+		{name: "selector set", selector: &metav1.LabelSelector{MatchLabels: map[string]string{"pv-label": "some-value"}}},
+		{name: "selector absent", selector: nil},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pvc := newRestorePVC(testOrigNamespace, testRestorePVCName, nil)
+			pvc.Spec.VolumeName = "pvc-original-pv"
+			pvc.Spec.Selector = tc.selector
+			item := restorePVCToUnstructured(t, pvc)
+
+			cleaned, err := clearPVCBinding(item)
+			require.NoError(t, err)
+
+			selectorMap, found, err := unstructured.NestedMap(cleaned.UnstructuredContent(), "spec", "selector")
+			require.NoError(t, err)
+			if tc.selector == nil {
+				assert.False(t, found, "clearPVCBinding must not add a selector that wasn't there")
+			} else {
+				require.True(t, found, "clearPVCBinding must not remove an existing selector")
+				matchLabels, ok := selectorMap["matchLabels"].(map[string]interface{})
+				require.True(t, ok)
+				assert.Equal(t, "some-value", matchLabels["pv-label"], "clearPVCBinding must not alter an existing selector's content")
+			}
+		})
+	}
+}
+
 // nonUnstructuredCopyItem wraps a real *unstructured.Unstructured but breaks
 // the runtime.Unstructured contract on DeepCopyObject, simulating an item
 // implementation whose deep copy doesn't preserve the interface -- used to
