@@ -363,6 +363,26 @@ func TestVMRestorePlugin_Progress_MalformedOperationID(t *testing.T) {
 	assert.NotEmpty(t, progress.Err)
 }
 
+func TestVMRestorePlugin_Progress_ListError(t *testing.T) {
+	fakeDynamic := newDataUploadDynamicClient(t)
+	fakeDynamic.PrependReactor("list", "datadownloads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("simulated list failure")
+	})
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := NewRestorePlugin(newTestLogger())
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName2, Namespace: "velero"},
+		Spec:       velerov1.RestoreSpec{BackupName: testBackupName},
+	}
+	operationID := generateVMRestoreOperationID(testRestoreName2, testNamespace, testRestoreVMName)
+
+	progress, err := plugin.Progress(operationID, restore)
+
+	require.Error(t, err)
+	assert.False(t, progress.Completed)
+}
+
 func TestVMRestorePlugin_Progress_NoDataDownloadsYet(t *testing.T) {
 	fakeDynamic := newDataUploadDynamicClient(t)
 	withFakeDynamicClient(t, fakeDynamic)
