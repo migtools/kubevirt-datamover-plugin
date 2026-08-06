@@ -429,6 +429,12 @@ func parseVMRestoreOperationID(operationID, expectedRestoreName string) (namespa
 // plugin stamps in pvc/restore.go) and filters client-side to the ones
 // correlated to the given VM via the AnnotationVMName/AnnotationVMNamespace
 // annotations that same plugin stamps on every DataDownload it creates.
+//
+// The List call leaves ListOptions.Limit unset, so the API server returns
+// the entire matching set in one response rather than paginating via a
+// continue token -- deliberately, since this restore-scoped set is one
+// DataDownload per PVC across all of a restore's kubevirt VMs, orders of
+// magnitude below what would ever force the server to chunk a response.
 func (p *RestorePlugin) getDataDownloadsForVM(dynamicClient dynamicClientInterface, restore *velerov1.Restore, namespace, vmName string) ([]velerov2alpha1.DataDownload, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
 	defer cancel()
