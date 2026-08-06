@@ -384,22 +384,42 @@ func TestVMRestorePlugin_Progress_ListError(t *testing.T) {
 }
 
 func TestVMRestorePlugin_Progress_NoDataDownloadsYet(t *testing.T) {
-	fakeDynamic := newDataUploadDynamicClient(t)
-	withFakeDynamicClient(t, fakeDynamic)
-
-	plugin := NewRestorePlugin(newTestLogger())
-	restore := &velerov1.Restore{
-		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName2, Namespace: "velero"},
-		Spec:       velerov1.RestoreSpec{BackupName: testBackupName},
+	testCases := []struct {
+		name              string
+		restoreStarted    *metav1.Time
+		expectedCompleted bool
+		expectErr         bool
+	}{
+		{name: "no restore start timestamp recorded", restoreStarted: nil, expectedCompleted: false},
+		{name: "within grace period", restoreStarted: ptr.To(metav1.NewTime(time.Now().Add(-time.Minute))), expectedCompleted: false},
+		{name: "grace period expired", restoreStarted: ptr.To(metav1.NewTime(time.Now().Add(-(firstDataDownloadGracePeriod + time.Minute)))), expectedCompleted: true, expectErr: true},
 	}
-	operationID := generateVMRestoreOperationID(testRestoreName2, testNamespace, testRestoreVMName)
 
-	progress, err := plugin.Progress(operationID, restore)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeDynamic := newDataUploadDynamicClient(t)
+			withFakeDynamicClient(t, fakeDynamic)
 
-	require.NoError(t, err)
-	assert.False(t, progress.Completed, "an empty list means the sibling PVC plugin hasn't created the DataDownload(s) yet, not that none will ever exist")
-	assert.Equal(t, "Waiting for kubevirt datamover DataDownload(s) to appear for this VM", progress.Description)
-	assert.Empty(t, progress.Err)
+			plugin := NewRestorePlugin(newTestLogger())
+			restore := &velerov1.Restore{
+				ObjectMeta: metav1.ObjectMeta{Name: testRestoreName2, Namespace: "velero"},
+				Spec:       velerov1.RestoreSpec{BackupName: testBackupName},
+				Status:     velerov1.RestoreStatus{StartTimestamp: tc.restoreStarted},
+			}
+			operationID := generateVMRestoreOperationID(testRestoreName2, testNamespace, testRestoreVMName)
+
+			progress, err := plugin.Progress(operationID, restore)
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.expectedCompleted, progress.Completed, "an empty list means the sibling PVC plugin hasn't created the DataDownload(s) yet -- until the grace period since restore start elapses")
+			if tc.expectErr {
+				assert.NotEmpty(t, progress.Err)
+			} else {
+				assert.Equal(t, "Waiting for kubevirt datamover DataDownload(s) to appear for this VM", progress.Description)
+				assert.Empty(t, progress.Err)
+			}
+		})
+	}
 }
 
 func TestVMRestorePlugin_Progress_Aggregation(t *testing.T) {
