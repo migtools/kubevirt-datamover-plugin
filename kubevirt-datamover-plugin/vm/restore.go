@@ -282,11 +282,14 @@ func (p *RestorePlugin) Progress(operationID string, restore *velerov1.Restore) 
 	}
 
 	if len(dataDownloads) == 0 {
-		// Nothing to wait for: this VM's disks were not (or no longer)
-		// restored via the kubevirt datamover, so there's no DataDownload
-		// completion to gate on.
-		progress.Completed = true
-		progress.Description = "No kubevirt datamover DataDownloads found for this VM"
+		// The sibling PVC plugin creates this VM's DataDownload(s)
+		// asynchronously, and Execute() only registers this operation for
+		// VMs that carried a datamover DataUpload annotation at backup
+		// time -- so an empty list here means "not created yet", not
+		// "will never exist". Keep the operation in progress and let
+		// Velero's own per-operation timeout bound how long we wait for
+		// the first one to appear.
+		progress.Description = "Waiting for kubevirt datamover DataDownload(s) to appear for this VM"
 		return progress, nil
 	}
 

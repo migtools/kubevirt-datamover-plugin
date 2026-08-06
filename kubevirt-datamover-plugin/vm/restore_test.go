@@ -356,7 +356,7 @@ func TestVMRestorePlugin_Progress_MalformedOperationID(t *testing.T) {
 	assert.NotEmpty(t, progress.Err)
 }
 
-func TestVMRestorePlugin_Progress_NoDataDownloads(t *testing.T) {
+func TestVMRestorePlugin_Progress_NoDataDownloadsYet(t *testing.T) {
 	fakeDynamic := newDataUploadDynamicClient(t)
 	withFakeDynamicClient(t, fakeDynamic)
 
@@ -370,7 +370,7 @@ func TestVMRestorePlugin_Progress_NoDataDownloads(t *testing.T) {
 	progress, err := plugin.Progress(operationID, restore)
 
 	require.NoError(t, err)
-	assert.True(t, progress.Completed, "nothing to wait for when this VM has no sibling DataDownloads")
+	assert.False(t, progress.Completed, "an empty list means the sibling PVC plugin hasn't created the DataDownload(s) yet, not that none will ever exist")
 }
 
 func TestVMRestorePlugin_Progress_Aggregation(t *testing.T) {
