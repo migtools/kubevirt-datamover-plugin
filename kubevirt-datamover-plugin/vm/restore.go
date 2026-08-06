@@ -17,6 +17,7 @@ package vm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -56,6 +57,27 @@ const (
 	runStrategySourceRunStrategy = "runStrategy"
 	runStrategySourceRunning     = "running"
 )
+
+// dataDownloadGVR identifies the Velero DataDownload custom resource that
+// getDataDownloadsForVM and patchDataDownloadCancel operate on via the
+// dynamic client.
+var dataDownloadGVR = schema.GroupVersionResource{
+	Group:    "velero.io",
+	Version:  "v2alpha1",
+	Resource: "datadownloads",
+}
+
+// newDataDownloadClient builds a dynamic client for DataDownload access.
+// Callers that need more than one DataDownload API call within a single
+// Progress/Cancel invocation (e.g. Cancel's per-sibling patch loop) should
+// build it once and reuse it, rather than rebuilding it per call.
+func newDataDownloadClient() (dynamicClientInterface, error) {
+	config, err := clients.GetInClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
+	}
+	return getDynamicClient(config)
+}
 
 // RestorePlugin is a RestoreItemActionV2 plugin for VirtualMachine resources
 // that halts a kubevirt-datamover-backed VM at restore time. This closes a
@@ -247,7 +269,13 @@ func (p *RestorePlugin) Progress(operationID string, restore *velerov1.Restore) 
 		return progress, nil
 	}
 
-	dataDownloads, err := p.getDataDownloadsForVM(restore, namespace, vmName)
+	dynamicClient, err := newDataDownloadClient()
+	if err != nil {
+		p.Log.Warnf("[vm-restore] Failed to get dynamic client for VM %s/%s: %v", namespace, vmName, err)
+		return progress, err
+	}
+
+	dataDownloads, err := p.getDataDownloadsForVM(dynamicClient, restore, namespace, vmName)
 	if err != nil {
 		p.Log.Warnf("[vm-restore] Failed to list DataDownloads for VM %s/%s: %v", namespace, vmName, err)
 		return progress, err
@@ -275,6 +303,12 @@ func (p *RestorePlugin) Progress(operationID string, restore *velerov1.Restore) 
 			msg := dd.Status.Message
 			if msg == "" {
 				msg = fmt.Sprintf("DataDownload %s/%s failed", dd.Namespace, dd.Name)
+			}
+			failMsgs = append(failMsgs, msg)
+		case velerov2alpha1.DataDownloadPhaseCanceled:
+			msg := dd.Status.Message
+			if msg == "" {
+				msg = fmt.Sprintf("DataDownload %s/%s was canceled", dd.Namespace, dd.Name)
 			}
 			failMsgs = append(failMsgs, msg)
 		default:
@@ -327,18 +361,24 @@ func (p *RestorePlugin) Cancel(operationID string, restore *velerov1.Restore) er
 		return err
 	}
 
-	dataDownloads, err := p.getDataDownloadsForVM(restore, namespace, vmName)
+	dynamicClient, err := newDataDownloadClient()
+	if err != nil {
+		return fmt.Errorf("failed to get dynamic client for cancellation: %w", err)
+	}
+
+	dataDownloads, err := p.getDataDownloadsForVM(dynamicClient, restore, namespace, vmName)
 	if err != nil {
 		return fmt.Errorf("failed to get DataDownloads for cancellation: %w", err)
 	}
 
+	var cancelErrs []error
 	for _, dd := range dataDownloads {
-		if err := p.patchDataDownloadCancel(dd); err != nil {
-			return fmt.Errorf("failed to cancel DataDownload %s/%s: %w", dd.Namespace, dd.Name, err)
+		if err := p.patchDataDownloadCancel(dynamicClient, dd); err != nil {
+			cancelErrs = append(cancelErrs, fmt.Errorf("failed to cancel DataDownload %s/%s: %w", dd.Namespace, dd.Name, err))
 		}
 	}
 
-	return nil
+	return errors.Join(cancelErrs...)
 }
 
 // AreAdditionalItemsReady is not used by this plugin: completion is tracked
@@ -380,27 +420,11 @@ func parseVMRestoreOperationID(operationID, expectedRestoreName string) (namespa
 // plugin stamps in pvc/restore.go) and filters client-side to the ones
 // correlated to the given VM via the AnnotationVMName/AnnotationVMNamespace
 // annotations that same plugin stamps on every DataDownload it creates.
-func (p *RestorePlugin) getDataDownloadsForVM(restore *velerov1.Restore, namespace, vmName string) ([]velerov2alpha1.DataDownload, error) {
-	config, err := clients.GetInClusterConfig()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
-	}
-
-	dynamicClient, err := getDynamicClient(config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get dynamic client: %w", err)
-	}
-
-	gvr := schema.GroupVersionResource{
-		Group:    "velero.io",
-		Version:  "v2alpha1",
-		Resource: "datadownloads",
-	}
-
+func (p *RestorePlugin) getDataDownloadsForVM(dynamicClient dynamicClientInterface, restore *velerov1.Restore, namespace, vmName string) ([]velerov2alpha1.DataDownload, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
 	defer cancel()
 
-	list, err := dynamicClient.Resource(gvr).Namespace(restore.Namespace).List(ctx, metav1.ListOptions{
+	list, err := dynamicClient.Resource(dataDownloadGVR).Namespace(restore.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("%s=%s,%s=%s",
 			controllercommon.LabelVeleroBackupName, controllercommon.SafeLabelValue(restore.Spec.BackupName),
 			controllercommon.LabelVeleroRestoreName, controllercommon.SafeLabelValue(restore.Name)),
@@ -438,17 +462,7 @@ func (p *RestorePlugin) getDataDownloadsForVM(restore *velerov1.Restore, namespa
 // and discards its returned error, so a single transient failure here would
 // otherwise leave the DataDownload (and its downloader pod) running with no
 // other mechanism to ever retry the cancellation.
-func (p *RestorePlugin) patchDataDownloadCancel(dd velerov2alpha1.DataDownload) error {
-	config, err := clients.GetInClusterConfig()
-	if err != nil {
-		return fmt.Errorf("failed to get in-cluster config: %w", err)
-	}
-
-	dynamicClient, err := getDynamicClient(config)
-	if err != nil {
-		return fmt.Errorf("failed to get dynamic client: %w", err)
-	}
-
+func (p *RestorePlugin) patchDataDownloadCancel(dynamicClient dynamicClientInterface, dd velerov2alpha1.DataDownload) error {
 	patch, err := json.Marshal(map[string]interface{}{
 		"spec": map[string]interface{}{
 			"cancel": true,
@@ -456,12 +470,6 @@ func (p *RestorePlugin) patchDataDownloadCancel(dd velerov2alpha1.DataDownload) 
 	})
 	if err != nil {
 		return fmt.Errorf("failed to build DataDownload cancel patch: %w", err)
-	}
-
-	gvr := schema.GroupVersionResource{
-		Group:    "velero.io",
-		Version:  "v2alpha1",
-		Resource: "datadownloads",
 	}
 
 	parentCtx, cancelParent := context.WithTimeout(context.Background(), cancelPatchTotalTimeout)
@@ -472,7 +480,7 @@ func (p *RestorePlugin) patchDataDownloadCancel(dd velerov2alpha1.DataDownload) 
 	}, func() error {
 		ctx, cancel := context.WithTimeout(parentCtx, apiCallTimeout)
 		defer cancel()
-		_, patchErr := dynamicClient.Resource(gvr).Namespace(dd.Namespace).Patch(
+		_, patchErr := dynamicClient.Resource(dataDownloadGVR).Namespace(dd.Namespace).Patch(
 			ctx,
 			dd.Name,
 			types.MergePatchType,

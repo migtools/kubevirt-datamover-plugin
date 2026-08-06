@@ -16,6 +16,7 @@ package vm
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -25,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -381,6 +383,7 @@ func TestVMRestorePlugin_Progress_Aggregation(t *testing.T) {
 		{name: "all completed", phases: []velerov2alpha1.DataDownloadPhase{velerov2alpha1.DataDownloadPhaseCompleted, velerov2alpha1.DataDownloadPhaseCompleted}, expectedCompleted: true},
 		{name: "one still in progress", phases: []velerov2alpha1.DataDownloadPhase{velerov2alpha1.DataDownloadPhaseCompleted, velerov2alpha1.DataDownloadPhaseInProgress}, expectedCompleted: false},
 		{name: "one failed", phases: []velerov2alpha1.DataDownloadPhase{velerov2alpha1.DataDownloadPhaseCompleted, velerov2alpha1.DataDownloadPhaseFailed}, expectedCompleted: true, expectErr: true},
+		{name: "one canceled", phases: []velerov2alpha1.DataDownloadPhase{velerov2alpha1.DataDownloadPhaseCompleted, velerov2alpha1.DataDownloadPhaseCanceled}, expectedCompleted: true, expectErr: true},
 	}
 
 	for _, tc := range testCases {
@@ -472,6 +475,40 @@ func TestVMRestorePlugin_Cancel_PatchesOnlyMatchingVM(t *testing.T) {
 	decoyDD := &velerov2alpha1.DataDownload{}
 	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(decoyAfter.Object, decoyDD))
 	assert.False(t, decoyDD.Spec.Cancel, "Cancel must not touch DataDownloads for other VMs")
+}
+
+func TestVMRestorePlugin_Cancel_AttemptsAllAndAggregatesErrors(t *testing.T) {
+	withFastCancelBackoff(t)
+
+	ok := newTestDataDownload("dd-vm-cancel-ok", "velero", testBackupName, testRestoreName2, testNamespace, testRestoreVMName, velerov2alpha1.DataDownloadPhaseInProgress)
+	failing := newTestDataDownload("dd-vm-cancel-fail", "velero", testBackupName, testRestoreName2, testNamespace, testRestoreVMName, velerov2alpha1.DataDownloadPhaseInProgress)
+
+	fakeDynamic := newDataUploadDynamicClient(t, dataDownloadUnstructured(t, ok), dataDownloadUnstructured(t, failing))
+	fakeDynamic.PrependReactor("patch", "datadownloads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.(k8stesting.PatchAction).GetName() == failing.Name {
+			return true, nil, fmt.Errorf("simulated patch failure")
+		}
+		return false, nil, nil
+	})
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := NewRestorePlugin(newTestLogger())
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName2, Namespace: "velero"},
+		Spec:       velerov1.RestoreSpec{BackupName: testBackupName},
+	}
+	operationID := generateVMRestoreOperationID(testRestoreName2, testNamespace, testRestoreVMName)
+
+	err := plugin.Cancel(operationID, restore)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), failing.Name, "aggregated error must identify the DataDownload that failed to cancel")
+
+	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datadownloads"}
+	updatedOK, getErr := fakeDynamic.Resource(gvr).Namespace("velero").Get(context.Background(), ok.Name, metav1.GetOptions{})
+	require.NoError(t, getErr)
+	updatedOKDD := &velerov2alpha1.DataDownload{}
+	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(updatedOK.Object, updatedOKDD))
+	assert.True(t, updatedOKDD.Spec.Cancel, "Cancel must still patch the other sibling DataDownload even though one patch failed")
 }
 
 func TestVMRestorePlugin_AreAdditionalItemsReady(t *testing.T) {
