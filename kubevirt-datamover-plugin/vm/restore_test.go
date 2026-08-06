@@ -132,7 +132,7 @@ func TestVMRestorePlugin_Execute_NotAutoStarting(t *testing.T) {
 	}{
 		{name: "RunStrategyHalted", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.RunStrategy = ptr.To(kvcore.RunStrategyHalted) }},
 		{name: "RunStrategyManual", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.RunStrategy = ptr.To(kvcore.RunStrategyManual) }},
-		{name: "Running=false", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.Running = boolPtr(false) }},
+		{name: "Running=false", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.Running = ptr.To(false) }},
 		{name: "neither field set", mod: func(vm *kvcore.VirtualMachine) {}},
 	}
 
@@ -180,7 +180,7 @@ func TestVMRestorePlugin_Execute_HaltsRunStrategy(t *testing.T) {
 	require.True(t, found)
 	assert.Equal(t, string(kvcore.RunStrategyHalted), runStrategy)
 
-	_, found, err = unstructured.NestedString(content, "spec", "running")
+	_, found, err = unstructured.NestedBool(content, "spec", "running")
 	require.NoError(t, err)
 	assert.False(t, found, "spec.running must not be set alongside spec.runStrategy")
 
@@ -204,7 +204,7 @@ func TestVMRestorePlugin_Execute_HaltsDeprecatedRunningBool(t *testing.T) {
 	plugin := NewRestorePlugin(newTestLogger())
 
 	vmObj := newRestoreTestVM(testNamespace, testRestoreVMName, datamoverAnnotations(nil))
-	vmObj.Spec.Running = boolPtr(true)
+	vmObj.Spec.Running = ptr.To(true)
 	vmItem := vmToUnstructured(t, vmObj)
 
 	restore := &velerov1.Restore{ObjectMeta: metav1.ObjectMeta{Name: testRestoreName2, Namespace: "velero"}}
@@ -291,8 +291,8 @@ func TestOriginalRunState(t *testing.T) {
 		{name: "RunStrategyHalted", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.RunStrategy = ptr.To(kvcore.RunStrategyHalted) }, expectedSource: runStrategySourceRunStrategy, expectedValue: "Halted", expectedRun: false},
 		{name: "RunStrategyManual", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.RunStrategy = ptr.To(kvcore.RunStrategyManual) }, expectedSource: runStrategySourceRunStrategy, expectedValue: "Manual", expectedRun: false},
 		{name: "RunStrategyWaitAsReceiver", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.RunStrategy = ptr.To(kvcore.RunStrategyWaitAsReceiver) }, expectedSource: runStrategySourceRunStrategy, expectedValue: "WaitAsReceiver", expectedRun: false},
-		{name: "Running=true", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.Running = boolPtr(true) }, expectedSource: runStrategySourceRunning, expectedValue: "Always", expectedRun: true},
-		{name: "Running=false", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.Running = boolPtr(false) }, expectedSource: runStrategySourceRunning, expectedValue: "Halted", expectedRun: false},
+		{name: "Running=true", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.Running = ptr.To(true) }, expectedSource: runStrategySourceRunning, expectedValue: "Always", expectedRun: true},
+		{name: "Running=false", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.Running = ptr.To(false) }, expectedSource: runStrategySourceRunning, expectedValue: "Halted", expectedRun: false},
 		{name: "neither set", mod: func(vm *kvcore.VirtualMachine) {}, expectedSource: "", expectedValue: "", expectedRun: false},
 	}
 
@@ -312,6 +312,11 @@ func TestOriginalRunState(t *testing.T) {
 
 func TestGenerateAndParseVMRestoreOperationID(t *testing.T) {
 	id := generateVMRestoreOperationID(testRestoreName2, testNamespace, testRestoreVMName)
+
+	assert.Equal(t, id, generateVMRestoreOperationID(testRestoreName2, testNamespace, testRestoreVMName),
+		"the operation ID must be deterministic so it survives a Velero server restart mid-restore")
+	assert.NotEqual(t, id, generateVMRestoreOperationID(testRestoreName2, testNamespace, "other-vm"),
+		"distinct VMs in one restore must get distinct operation IDs")
 
 	namespace, vmName, err := parseVMRestoreOperationID(id, testRestoreName2)
 	require.NoError(t, err)
@@ -426,13 +431,20 @@ func TestVMRestorePlugin_Progress_Aggregation(t *testing.T) {
 	testCases := []struct {
 		name              string
 		phases            []velerov2alpha1.DataDownloadPhase
+		message           string
 		expectedCompleted bool
 		expectErr         bool
+		expectedErrText   string
 	}{
 		{name: "all completed", phases: []velerov2alpha1.DataDownloadPhase{velerov2alpha1.DataDownloadPhaseCompleted, velerov2alpha1.DataDownloadPhaseCompleted}, expectedCompleted: true},
 		{name: "one still in progress", phases: []velerov2alpha1.DataDownloadPhase{velerov2alpha1.DataDownloadPhaseCompleted, velerov2alpha1.DataDownloadPhaseInProgress}, expectedCompleted: false},
 		{name: "one failed", phases: []velerov2alpha1.DataDownloadPhase{velerov2alpha1.DataDownloadPhaseCompleted, velerov2alpha1.DataDownloadPhaseFailed}, expectedCompleted: true, expectErr: true},
 		{name: "one canceled", phases: []velerov2alpha1.DataDownloadPhase{velerov2alpha1.DataDownloadPhaseCompleted, velerov2alpha1.DataDownloadPhaseCanceled}, expectedCompleted: true, expectErr: true},
+		// A failure must short-circuit the aggregation even while a sibling is
+		// still running, so Velero stops polling instead of waiting out the
+		// per-operation timeout.
+		{name: "failed alongside in progress", phases: []velerov2alpha1.DataDownloadPhase{velerov2alpha1.DataDownloadPhaseInProgress, velerov2alpha1.DataDownloadPhaseFailed}, expectedCompleted: true, expectErr: true},
+		{name: "failed with controller message", phases: []velerov2alpha1.DataDownloadPhase{velerov2alpha1.DataDownloadPhaseFailed}, message: "repository unreachable", expectedCompleted: true, expectErr: true, expectedErrText: "repository unreachable"},
 	}
 
 	for _, tc := range testCases {
@@ -447,6 +459,7 @@ func TestVMRestorePlugin_Progress_Aggregation(t *testing.T) {
 				dd.Name = dd.Name + string(rune('a'+i))
 				dd.Status.Progress.TotalBytes = int64(100 * (i + 1))
 				dd.Status.Progress.BytesDone = int64(50 * (i + 1))
+				dd.Status.Message = tc.message
 				// Later entries start later, so the first entry is always the
 				// earliest -- tests that progress.Started picks the minimum
 				// across all matching DataDownloads, not just the last one seen.
@@ -489,6 +502,10 @@ func TestVMRestorePlugin_Progress_Aggregation(t *testing.T) {
 			assert.True(t, progress.Started.Equal(wantEarliest), "Started must be the earliest StartTimestamp among this VM's matching DataDownloads, excluding the decoy")
 			if tc.expectErr {
 				assert.NotEmpty(t, progress.Err)
+				if tc.expectedErrText != "" {
+					assert.Contains(t, progress.Err, tc.expectedErrText,
+						"the controller's own failure message must reach the operator, not the synthesized fallback")
+				}
 			} else {
 				assert.Empty(t, progress.Err)
 			}
