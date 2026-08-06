@@ -35,6 +35,7 @@ import (
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	riav2 "github.com/vmware-tanzu/velero/pkg/plugin/velero/restoreitemaction/v2"
 
 	kvcore "kubevirt.io/api/core/v1"
 
@@ -91,6 +92,11 @@ func newDataDownloadClient() (dynamicClientInterface, error) {
 type RestorePlugin struct {
 	Log logrus.FieldLogger
 }
+
+// Compile-time assertion that RestorePlugin implements the full
+// RestoreItemActionV2 interface, so a signature drift on any method fails
+// the build instead of surfacing as a runtime plugin-registration error.
+var _ riav2.RestoreItemAction = &RestorePlugin{}
 
 // NewRestorePlugin creates a new VirtualMachine RestorePlugin instance.
 func NewRestorePlugin(log logrus.FieldLogger) *RestorePlugin {
