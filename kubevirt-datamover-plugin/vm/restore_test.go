@@ -426,13 +426,13 @@ func TestVMRestorePlugin_Progress_ListError(t *testing.T) {
 func TestVMRestorePlugin_Progress_NoDataDownloadsYet(t *testing.T) {
 	testCases := []struct {
 		name              string
-		restoreStarted    *metav1.Time
+		seedFirstSeen     *time.Time
 		expectedCompleted bool
 		expectErr         bool
 	}{
-		{name: "no restore start timestamp recorded", restoreStarted: nil, expectedCompleted: false},
-		{name: "within grace period", restoreStarted: ptr.To(metav1.NewTime(time.Now().Add(-firstDataDownloadGracePeriod / 2))), expectedCompleted: false},
-		{name: "grace period expired", restoreStarted: ptr.To(metav1.NewTime(time.Now().Add(-2 * firstDataDownloadGracePeriod))), expectedCompleted: true, expectErr: true},
+		{name: "first poll, nothing seeded", expectedCompleted: false},
+		{name: "within grace period", seedFirstSeen: ptr.To(time.Now().Add(-firstDataDownloadGracePeriod / 2)), expectedCompleted: false},
+		{name: "grace period expired", seedFirstSeen: ptr.To(time.Now().Add(-2 * firstDataDownloadGracePeriod)), expectedCompleted: true, expectErr: true},
 	}
 
 	for _, tc := range testCases {
@@ -444,14 +444,18 @@ func TestVMRestorePlugin_Progress_NoDataDownloadsYet(t *testing.T) {
 			restore := &velerov1.Restore{
 				ObjectMeta: metav1.ObjectMeta{Name: testRestoreName2, Namespace: "velero"},
 				Spec:       velerov1.RestoreSpec{BackupName: testBackupName},
-				Status:     velerov1.RestoreStatus{StartTimestamp: tc.restoreStarted},
 			}
 			operationID := generateVMRestoreOperationID(testRestoreName2, testNamespace, testRestoreVMName)
+			firstEmptyObservedAt.Delete(operationID)
+			t.Cleanup(func() { firstEmptyObservedAt.Delete(operationID) })
+			if tc.seedFirstSeen != nil {
+				firstEmptyObservedAt.Store(operationID, *tc.seedFirstSeen)
+			}
 
 			progress, err := plugin.Progress(operationID, restore)
 
 			require.NoError(t, err)
-			assert.Equal(t, tc.expectedCompleted, progress.Completed, "an empty list means the sibling PVC plugin hasn't created the DataDownload(s) yet -- until the grace period since restore start elapses")
+			assert.Equal(t, tc.expectedCompleted, progress.Completed, "an empty list means the sibling PVC plugin hasn't created the DataDownload(s) yet -- until the grace period since this operation first observed an empty list elapses")
 			if tc.expectErr {
 				assert.NotEmpty(t, progress.Err)
 			} else {
@@ -460,6 +464,34 @@ func TestVMRestorePlugin_Progress_NoDataDownloadsYet(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestVMRestorePlugin_Progress_ClearsGracePeriodTrackingOnceDataDownloadAppears(t *testing.T) {
+	dd := newTestDataDownload("dd-vm-progress", "velero", testBackupName, testRestoreName2, testNamespace, testRestoreVMName, velerov2alpha1.DataDownloadPhaseCompleted)
+	fakeDynamic := newDataUploadDynamicClient(t, dataDownloadUnstructured(t, dd))
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := NewRestorePlugin(newTestLogger())
+	restore := &velerov1.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: testRestoreName2, Namespace: "velero"},
+		Spec:       velerov1.RestoreSpec{BackupName: testBackupName},
+	}
+	operationID := generateVMRestoreOperationID(testRestoreName2, testNamespace, testRestoreVMName)
+	t.Cleanup(func() { firstEmptyObservedAt.Delete(operationID) })
+
+	// Seed a stale, already-expired tracking entry, as if a prior poll had
+	// observed an empty list long ago -- a later poll that finds a
+	// DataDownload must ignore/clear it rather than ever consulting it.
+	firstEmptyObservedAt.Store(operationID, time.Now().Add(-2*firstDataDownloadGracePeriod))
+
+	progress, err := plugin.Progress(operationID, restore)
+
+	require.NoError(t, err)
+	assert.True(t, progress.Completed)
+	assert.Empty(t, progress.Err, "a discovered DataDownload must be aggregated normally, not short-circuited by a stale empty-list timeout")
+
+	_, stillTracked := firstEmptyObservedAt.Load(operationID)
+	assert.False(t, stillTracked, "tracking entry must be cleared once a DataDownload is observed for this operation")
 }
 
 func TestVMRestorePlugin_Progress_Aggregation(t *testing.T) {
