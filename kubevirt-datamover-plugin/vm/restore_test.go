@@ -299,6 +299,18 @@ func TestOriginalRunState(t *testing.T) {
 		{name: "Running=false", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.Running = ptr.To(false) }, expectedSource: runStrategySourceRunning, expectedValue: "Halted", expectedRun: false},
 		{name: "neither set", mod: func(vm *kvcore.VirtualMachine) {}, expectedSource: "", expectedValue: "", expectedRun: false},
 		{
+			// A run strategy this plugin does not recognize must be treated as
+			// non-auto-starting: skipping the halt is safe, whereas halting a
+			// VM whose original state the controller cannot restore is not.
+			name: "unrecognized run strategy is treated as not auto-starting",
+			mod: func(vm *kvcore.VirtualMachine) {
+				vm.Spec.RunStrategy = ptr.To(kvcore.VirtualMachineRunStrategy("SomeFutureStrategy"))
+			},
+			expectedSource: runStrategySourceRunStrategy,
+			expectedValue:  "SomeFutureStrategy",
+			expectedRun:    false,
+		},
+		{
 			name: "both set: runStrategy wins",
 			mod: func(vm *kvcore.VirtualMachine) {
 				vm.Spec.RunStrategy = ptr.To(kvcore.RunStrategyManual)
