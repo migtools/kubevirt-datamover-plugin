@@ -493,6 +493,11 @@ func (p *RestorePlugin) patchDataDownloadCancel(dynamicClient dynamicClientInter
 		return patchErr
 	})
 	if retryErr != nil {
+		if apierrors.IsNotFound(retryErr) {
+			// Already gone (e.g. completed and garbage-collected concurrently):
+			// nothing left to cancel, not a failure.
+			return nil
+		}
 		return fmt.Errorf("failed to update DataDownload: %w", retryErr)
 	}
 
