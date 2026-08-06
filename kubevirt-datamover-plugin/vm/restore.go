@@ -68,6 +68,16 @@ var dataDownloadGVR = schema.GroupVersionResource{
 	Resource: "datadownloads",
 }
 
+// firstDataDownloadGracePeriod bounds how long Progress will wait, from the
+// restore's own start time, for this VM's first sibling DataDownload to
+// appear before giving up. An empty list usually just means the sibling PVC
+// plugin hasn't gotten to this VM's PVCs yet, but it can also mean none of
+// them ended up in this restore at all (e.g. excluded by resource/namespace
+// filtering) -- in which case no DataDownload will ever appear, and waiting
+// out Velero's own (much longer) per-operation timeout instead would delay
+// surfacing that failure far more than necessary.
+const firstDataDownloadGracePeriod = 10 * time.Minute
+
 // newDataDownloadClient builds a dynamic client for DataDownload access.
 // Callers that need more than one DataDownload API call within a single
 // Progress/Cancel invocation (e.g. Cancel's per-sibling patch loop) should
@@ -291,10 +301,19 @@ func (p *RestorePlugin) Progress(operationID string, restore *velerov1.Restore) 
 		// The sibling PVC plugin creates this VM's DataDownload(s)
 		// asynchronously, and Execute() only registers this operation for
 		// VMs that carried a datamover DataUpload annotation at backup
-		// time -- so an empty list here means "not created yet", not
-		// "will never exist". Keep the operation in progress and let
-		// Velero's own per-operation timeout bound how long we wait for
-		// the first one to appear.
+		// time -- so an empty list here usually means "not created yet".
+		// It can also mean this VM's PVCs never made it into the restore
+		// at all, in which case no DataDownload will ever appear -- so
+		// bound the wait by the restore's own start time instead of
+		// relying solely on Velero's much longer per-operation timeout.
+		if start := restore.Status.StartTimestamp; start != nil &&
+			time.Since(start.Time) > firstDataDownloadGracePeriod {
+			progress.Completed = true
+			progress.Err = fmt.Sprintf(
+				"no kubevirt datamover DataDownload appeared for VM %s/%s within %s of restore start",
+				namespace, vmName, firstDataDownloadGracePeriod)
+			return progress, nil
+		}
 		progress.Description = "Waiting for kubevirt datamover DataDownload(s) to appear for this VM"
 		return progress, nil
 	}
