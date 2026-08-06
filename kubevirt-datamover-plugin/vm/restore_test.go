@@ -152,6 +152,7 @@ func TestVMRestorePlugin_Execute_NotAutoStarting(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, output)
 			assert.Equal(t, expected, output.UpdatedItem, "a VM that would not auto-start its VMI cannot race a launcher pod into existence, so Execute must leave it untouched")
+			assert.Equal(t, expected, vmItem, "Execute must not mutate the passed-in Item")
 			assert.Empty(t, output.OperationID)
 		})
 	}
@@ -294,6 +295,16 @@ func TestOriginalRunState(t *testing.T) {
 		{name: "Running=true", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.Running = ptr.To(true) }, expectedSource: runStrategySourceRunning, expectedValue: "Always", expectedRun: true},
 		{name: "Running=false", mod: func(vm *kvcore.VirtualMachine) { vm.Spec.Running = ptr.To(false) }, expectedSource: runStrategySourceRunning, expectedValue: "Halted", expectedRun: false},
 		{name: "neither set", mod: func(vm *kvcore.VirtualMachine) {}, expectedSource: "", expectedValue: "", expectedRun: false},
+		{
+			name: "both set: runStrategy wins",
+			mod: func(vm *kvcore.VirtualMachine) {
+				vm.Spec.RunStrategy = ptr.To(kvcore.RunStrategyManual)
+				vm.Spec.Running = ptr.To(true)
+			},
+			expectedSource: runStrategySourceRunStrategy,
+			expectedValue:  "Manual",
+			expectedRun:    false,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -396,8 +407,8 @@ func TestVMRestorePlugin_Progress_NoDataDownloadsYet(t *testing.T) {
 		expectErr         bool
 	}{
 		{name: "no restore start timestamp recorded", restoreStarted: nil, expectedCompleted: false},
-		{name: "within grace period", restoreStarted: ptr.To(metav1.NewTime(time.Now().Add(-time.Minute))), expectedCompleted: false},
-		{name: "grace period expired", restoreStarted: ptr.To(metav1.NewTime(time.Now().Add(-(firstDataDownloadGracePeriod + time.Minute)))), expectedCompleted: true, expectErr: true},
+		{name: "within grace period", restoreStarted: ptr.To(metav1.NewTime(time.Now().Add(-firstDataDownloadGracePeriod / 2))), expectedCompleted: false},
+		{name: "grace period expired", restoreStarted: ptr.To(metav1.NewTime(time.Now().Add(-2 * firstDataDownloadGracePeriod))), expectedCompleted: true, expectErr: true},
 	}
 
 	for _, tc := range testCases {
@@ -483,6 +494,15 @@ func TestVMRestorePlugin_Progress_Aggregation(t *testing.T) {
 			decoy.Status.StartTimestamp = &decoyStarted
 			objs = append(objs, dataDownloadUnstructured(t, decoy))
 
+			// Decoy DataDownload for the same VM but a *different* restore
+			// (e.g. left over from a prior restore attempt): the server-side
+			// label selector must scope by restore name, not just backup
+			// name, so this must not affect the aggregation either.
+			otherRestoreDecoy := newTestDataDownload("dd-other-restore-decoy", "velero", testBackupName, "some-other-restore", testNamespace, testRestoreVMName, velerov2alpha1.DataDownloadPhaseInProgress)
+			otherRestoreDecoy.Status.Progress.TotalBytes = 555555
+			otherRestoreDecoy.Status.Progress.BytesDone = 444444
+			objs = append(objs, dataDownloadUnstructured(t, otherRestoreDecoy))
+
 			fakeDynamic := newDataUploadDynamicClient(t, objs...)
 			withFakeDynamicClient(t, fakeDynamic)
 
@@ -520,6 +540,16 @@ func TestVMRestorePlugin_Cancel_NilRestore(t *testing.T) {
 	assert.Contains(t, err.Error(), "restore object is nil")
 }
 
+func TestVMRestorePlugin_Cancel_MalformedOperationID(t *testing.T) {
+	plugin := NewRestorePlugin(newTestLogger())
+	restore := &velerov1.Restore{ObjectMeta: metav1.ObjectMeta{Name: testRestoreName2, Namespace: "velero"}}
+
+	err := plugin.Cancel("not-a-valid-id", restore)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "malformed")
+}
+
 func TestVMRestorePlugin_Cancel_NoDataDownloads(t *testing.T) {
 	fakeDynamic := newDataUploadDynamicClient(t)
 	withFakeDynamicClient(t, fakeDynamic)
@@ -538,8 +568,9 @@ func TestVMRestorePlugin_Cancel_NoDataDownloads(t *testing.T) {
 func TestVMRestorePlugin_Cancel_PatchesOnlyMatchingVM(t *testing.T) {
 	dd := newTestDataDownload("dd-vm-cancel", "velero", testBackupName, testRestoreName2, testNamespace, testRestoreVMName, velerov2alpha1.DataDownloadPhaseInProgress)
 	decoy := newTestDataDownload("dd-vm-cancel-decoy", "velero", testBackupName, testRestoreName2, testNamespace, "some-other-vm", velerov2alpha1.DataDownloadPhaseInProgress)
+	otherRestoreDecoy := newTestDataDownload("dd-vm-cancel-other-restore-decoy", "velero", testBackupName, "some-other-restore", testNamespace, testRestoreVMName, velerov2alpha1.DataDownloadPhaseInProgress)
 
-	fakeDynamic := newDataUploadDynamicClient(t, dataDownloadUnstructured(t, dd), dataDownloadUnstructured(t, decoy))
+	fakeDynamic := newDataUploadDynamicClient(t, dataDownloadUnstructured(t, dd), dataDownloadUnstructured(t, decoy), dataDownloadUnstructured(t, otherRestoreDecoy))
 	withFakeDynamicClient(t, fakeDynamic)
 
 	plugin := NewRestorePlugin(newTestLogger())
@@ -565,6 +596,12 @@ func TestVMRestorePlugin_Cancel_PatchesOnlyMatchingVM(t *testing.T) {
 	decoyDD := &velerov2alpha1.DataDownload{}
 	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(decoyAfter.Object, decoyDD))
 	assert.False(t, decoyDD.Spec.Cancel, "Cancel must not touch DataDownloads for other VMs")
+
+	otherRestoreDecoyAfter, err := fakeDynamic.Resource(gvr).Namespace("velero").Get(context.Background(), "dd-vm-cancel-other-restore-decoy", metav1.GetOptions{})
+	require.NoError(t, err)
+	otherRestoreDecoyDD := &velerov2alpha1.DataDownload{}
+	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(otherRestoreDecoyAfter.Object, otherRestoreDecoyDD))
+	assert.False(t, otherRestoreDecoyDD.Spec.Cancel, "Cancel must not touch DataDownloads left over from a different restore of the same VM")
 }
 
 func TestVMRestorePlugin_Cancel_AttemptsAllAndAggregatesErrors(t *testing.T) {
