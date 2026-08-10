@@ -246,8 +246,25 @@ func TestRestorePlugin_Execute_Eligible(t *testing.T) {
 			// doc comment on Execute). If the code mistakenly read from Item
 			// instead, this PVC would be treated as ineligible and this test would
 			// fail with an empty OperationID.
-			item := restorePVCToUnstructured(t, newRestorePVC(testOrigNamespace, testRestorePVCName, nil))
-			expectedItem := item.DeepCopyObject().(runtime.Unstructured)
+			//
+			// Item also carries VolumeName/Status as the backed-up PVC would have
+			// (already bound to its pre-backup PV) -- Execute must clear both, or
+			// the datamover controller rejects the restored PVC as already bound.
+			itemPVC := newRestorePVC(testOrigNamespace, testRestorePVCName, nil)
+			itemPVC.Spec.VolumeName = "pvc-original-pv"
+			itemPVC.Status = corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound}
+			item := restorePVCToUnstructured(t, itemPVC)
+			originalItem := item.DeepCopyObject().(runtime.Unstructured)
+
+			// clearPVCBinding removes these fields entirely (via
+			// RemoveNestedField) rather than round-tripping through a typed
+			// struct with them zeroed -- match that here rather than
+			// re-deriving via restorePVCToUnstructured, which would leave an
+			// empty "status": {} behind instead of removing the key.
+			expectedUpdatedItem := item.DeepCopyObject().(runtime.Unstructured)
+			unstructured.RemoveNestedField(expectedUpdatedItem.UnstructuredContent(), "spec", "volumeName")
+			unstructured.RemoveNestedField(expectedUpdatedItem.UnstructuredContent(), "status")
+
 			restore := &velerov1.Restore{
 				ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS, UID: "restore-uid"},
 				Spec: velerov1.RestoreSpec{
@@ -265,8 +282,9 @@ func TestRestorePlugin_Execute_Eligible(t *testing.T) {
 
 			require.NoError(t, err)
 			require.NotNil(t, output)
-			assert.Equal(t, expectedItem, output.UpdatedItem, "Execute must return input.Item unmodified, not ItemFromBackup")
-			assert.Equal(t, expectedItem, item, "Execute must not mutate the passed-in Item")
+			assert.Equal(t, expectedUpdatedItem, output.UpdatedItem,
+				"Execute must clear Spec.VolumeName/Status on the returned item so the datamover controller can rebind a new PV")
+			assert.Equal(t, originalItem, item, "Execute must not mutate the passed-in Item")
 			assert.NotEmpty(t, output.OperationID)
 			assert.Empty(t, output.AdditionalItems, "DataDownload is created live, not sourced from the backup archive, so it must not be an AdditionalItem")
 
@@ -300,6 +318,130 @@ func TestRestorePlugin_Execute_Eligible(t *testing.T) {
 			assert.Equal(t, restore.UID, dd.OwnerReferences[0].UID)
 		})
 	}
+}
+
+func TestClearPVCBinding(t *testing.T) {
+	pvc := newRestorePVC(testOrigNamespace, testRestorePVCName, map[string]string{
+		controllercommon.AnnotationVMName: "my-vm",
+		kubeAnnBindCompleted:              "yes",
+		kubeAnnBoundByController:          "yes",
+	})
+	pvc.Spec.VolumeName = "pvc-original-pv"
+	pvc.Status = corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound}
+	item := restorePVCToUnstructured(t, pvc)
+
+	// A field the vendored corev1.PersistentVolumeClaim type doesn't know
+	// about (e.g. from a newer Kubernetes version than this plugin was built
+	// against) must survive -- proving clearPVCBinding operates on the raw
+	// unstructured content instead of round-tripping through the typed
+	// struct, which would silently drop it.
+	require.NoError(t, unstructured.SetNestedField(item.UnstructuredContent(), "some-value", "spec", "someFutureField"))
+
+	cleaned, err := clearPVCBinding(item)
+	require.NoError(t, err)
+
+	_, found, err := unstructured.NestedString(cleaned.UnstructuredContent(), "spec", "volumeName")
+	require.NoError(t, err)
+	assert.False(t, found, "spec.volumeName must be removed")
+
+	_, found, err = unstructured.NestedMap(cleaned.UnstructuredContent(), "status")
+	require.NoError(t, err)
+	assert.False(t, found, "status must be removed")
+
+	annotations, found, err := unstructured.NestedStringMap(cleaned.UnstructuredContent(), "metadata", "annotations")
+	require.NoError(t, err)
+	require.True(t, found)
+	// Velero's own restore.go only strips these two PV-controller bookkeeping
+	// annotations when it sees spec.volumeName still set *after* every
+	// RestoreItemAction has run -- since this plugin clears volumeName
+	// earlier in that same loop, that gate never fires for this PVC, so
+	// clearPVCBinding must strip them itself or they'd survive onto a PVC
+	// that otherwise looks completely unbound.
+	_, present := annotations[kubeAnnBindCompleted]
+	assert.False(t, present, "pv.kubernetes.io/bind-completed must be removed")
+	_, present = annotations[kubeAnnBoundByController]
+	assert.False(t, present, "pv.kubernetes.io/bound-by-controller must be removed")
+	assert.Equal(t, "my-vm", annotations[controllercommon.AnnotationVMName], "unrelated annotations must survive")
+
+	futureField, found, err := unstructured.NestedString(cleaned.UnstructuredContent(), "spec", "someFutureField")
+	require.NoError(t, err)
+	assert.True(t, found, "unknown fields must be preserved, not silently dropped")
+	assert.Equal(t, "some-value", futureField)
+
+	name, found, err := unstructured.NestedString(cleaned.UnstructuredContent(), "metadata", "name")
+	require.NoError(t, err)
+	assert.True(t, found)
+	assert.Equal(t, testRestorePVCName, name)
+
+	_, found, err = unstructured.NestedString(item.UnstructuredContent(), "spec", "volumeName")
+	require.NoError(t, err)
+	assert.True(t, found, "clearPVCBinding must not mutate the passed-in item")
+}
+
+// TestClearPVCBinding_LeavesSelectorUntouched documents current behavior:
+// clearPVCBinding does not clear/reset spec.selector. This is believed safe
+// because spec.selector is only meaningful for a PVC statically pre-bound to
+// an existing PV by label match; a kubevirt-datamover-backed PVC is always
+// dynamically provisioned via a StorageClass and so never has spec.selector
+// set to begin with, making a reset moot. If that assumption is ever wrong
+// for some PVC, this test pins today's actual (not just intended) behavior:
+// whatever was in spec.selector survives clearPVCBinding unchanged.
+func TestClearPVCBinding_LeavesSelectorUntouched(t *testing.T) {
+	testCases := []struct {
+		name     string
+		selector *metav1.LabelSelector
+	}{
+		{name: "selector set", selector: &metav1.LabelSelector{MatchLabels: map[string]string{"pv-label": "some-value"}}},
+		{name: "selector absent", selector: nil},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pvc := newRestorePVC(testOrigNamespace, testRestorePVCName, nil)
+			pvc.Spec.VolumeName = "pvc-original-pv"
+			pvc.Spec.Selector = tc.selector
+			item := restorePVCToUnstructured(t, pvc)
+
+			cleaned, err := clearPVCBinding(item)
+			require.NoError(t, err)
+
+			selectorMap, found, err := unstructured.NestedMap(cleaned.UnstructuredContent(), "spec", "selector")
+			require.NoError(t, err)
+			if tc.selector == nil {
+				assert.False(t, found, "clearPVCBinding must not add a selector that wasn't there")
+			} else {
+				require.True(t, found, "clearPVCBinding must not remove an existing selector")
+				matchLabels, ok := selectorMap["matchLabels"].(map[string]interface{})
+				require.True(t, ok)
+				assert.Equal(t, "some-value", matchLabels["pv-label"], "clearPVCBinding must not alter an existing selector's content")
+			}
+		})
+	}
+}
+
+// nonUnstructuredCopyItem wraps a real *unstructured.Unstructured but breaks
+// the runtime.Unstructured contract on DeepCopyObject, simulating an item
+// implementation whose deep copy doesn't preserve the interface -- used to
+// exercise clearPVCBinding's defensive type-assertion failure path, which no
+// real Velero-supplied item is expected to hit but should still fail loudly
+// rather than panic if it ever did.
+type nonUnstructuredCopyItem struct {
+	*unstructured.Unstructured
+}
+
+func (n *nonUnstructuredCopyItem) DeepCopyObject() runtime.Object {
+	return &corev1.Pod{}
+}
+
+func TestClearPVCBinding_DeepCopyNotUnstructured(t *testing.T) {
+	pvc := newRestorePVC(testOrigNamespace, testRestorePVCName, nil)
+	item := restorePVCToUnstructured(t, pvc).(*unstructured.Unstructured)
+	badItem := &nonUnstructuredCopyItem{Unstructured: item}
+
+	_, err := clearPVCBinding(badItem)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to copy restore item")
 }
 
 func TestRestorePlugin_Execute_LongOperationIDTruncatedInLabel(t *testing.T) {
