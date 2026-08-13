@@ -4,15 +4,15 @@ go 1.26.0
 
 require (
 	github.com/bombsimon/logrusr/v4 v4.1.0
-	github.com/google/uuid v1.6.0
-	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260724185405-922d19d3b4ba
+	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260813173242-d1bbb9d5d32f
 	github.com/sirupsen/logrus v1.9.4
 	github.com/stretchr/testify v1.11.1
 	github.com/vmware-tanzu/velero v1.18.1
-	github.com/vmware-tanzu/velero/pkg/apis v0.0.0-20260713215154-c825e3c136bc
+	github.com/vmware-tanzu/velero/pkg/apis v0.0.0
 	k8s.io/api v0.36.0
 	k8s.io/apimachinery v0.36.0
 	k8s.io/client-go v0.36.0
+	k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2
 	kubevirt.io/api v1.8.0-alpha.0
 	sigs.k8s.io/controller-runtime v0.24.0
 )
@@ -93,6 +93,7 @@ require (
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/gnostic-models v0.7.1 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.16 // indirect
 	github.com/googleapis/gax-go/v2 v2.22.0 // indirect
 	github.com/hashicorp/go-hclog v1.6.3 // indirect
@@ -156,7 +157,6 @@ require (
 	k8s.io/apiextensions-apiserver v0.36.0 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20260317180543-43fb72c5454a // indirect
-	k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2 // indirect
 	kubevirt.io/containerized-data-importer-api v1.63.1 // indirect
 	kubevirt.io/controller-lifecycle-operator-sdk/api v0.0.0-20220329064328-f3cc58c6ed90 // indirect
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
@@ -166,8 +166,10 @@ require (
 )
 
 // Use same velero fork as the controller for compatibility
-replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20260716151240-e2178e7e7c29
+replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20260805134104-2091b09b93bb
 
 exclude github.com/kcp-dev/kcp/sdk v0.0.0-00010101000000-000000000000
 
 replace github.com/migtools/kubevirt-datamover-controller => github.com/migtools/kubevirt-datamover-controller v0.0.0-20260729163752-37185892c605
+
+replace github.com/vmware-tanzu/velero/pkg/apis => github.com/openshift/velero/pkg/apis v0.0.0-20260805134104-2091b09b93bb
