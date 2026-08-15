@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/wait"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -512,6 +513,225 @@ func TestBackupPlugin_checkPreconditions(t *testing.T) {
 			}
 		})
 	}
+}
+
+// stubVolumeHelper is a minimal vhutil.VolumeHelper implementation used to
+// test checkVolumePolicies and getFirstKubevirtPVC in isolation, without
+// needing a real resource-policy ConfigMap wired through
+// volumehelper.NewVolumeHelperWithCache. Responses are keyed by the PVC name
+// read off the unstructured object each method is called with.
+type stubVolumeHelper struct {
+	shouldSnapshot    map[string]bool
+	shouldSnapshotErr map[string]error
+	shouldCustom      map[string]bool
+	shouldCustomErr   map[string]error
+}
+
+func (s *stubVolumeHelper) ShouldPerformSnapshot(obj runtime.Unstructured, _ schema.GroupResource) (bool, error) {
+	name := obj.(*unstructured.Unstructured).GetName()
+	if err, ok := s.shouldSnapshotErr[name]; ok {
+		return false, err
+	}
+	return s.shouldSnapshot[name], nil
+}
+
+func (s *stubVolumeHelper) ShouldPerformCustomAction(obj runtime.Unstructured, _ schema.GroupResource, _ map[string]any) (bool, error) {
+	name := obj.(*unstructured.Unstructured).GetName()
+	if err, ok := s.shouldCustomErr[name]; ok {
+		return false, err
+	}
+	return s.shouldCustom[name], nil
+}
+
+func (s *stubVolumeHelper) ShouldPerformFSBackup(corev1.Volume, corev1.Pod) (bool, error) {
+	return false, nil
+}
+
+func (s *stubVolumeHelper) GetActionParameters(runtime.Unstructured, schema.GroupResource) (bool, string, map[string]any, error) {
+	return false, "", nil, nil
+}
+
+// vmWithPVCVolumes returns a running test VM whose template has one PVC
+// volume per name in pvcNames (volume name == PVC name for simplicity).
+func vmWithPVCVolumes(namespace, name string, pvcNames ...string) *kvcore.VirtualMachine {
+	vm := createTestVM(namespace, name, kvcore.VirtualMachineStatusRunning)
+	for _, pvcName := range pvcNames {
+		vm.Spec.Template.Spec.Volumes = append(vm.Spec.Template.Spec.Volumes, kvcore.Volume{
+			Name: pvcName,
+			VolumeSource: kvcore.VolumeSource{
+				PersistentVolumeClaim: &kvcore.PersistentVolumeClaimVolumeSource{
+					PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvcName,
+					},
+				},
+			},
+		})
+	}
+	return vm
+}
+
+// withFakeCoreClient installs fakeCore as the package-level core client for
+// the duration of t, restoring it (to nil) via t.Cleanup.
+func withFakeCoreClient(t *testing.T, fakeCore *k8sfake.Clientset) {
+	t.Helper()
+	clients.SetCoreClient(fakeCore.CoreV1())
+	t.Cleanup(func() { clients.SetCoreClient(nil) })
+}
+
+func TestCheckVolumePolicies(t *testing.T) {
+	backup := &velerov1.Backup{ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"}}
+
+	t.Run("no PVCs", func(t *testing.T) {
+		vm := createTestVM(testNamespace, testVMName, kvcore.VirtualMachineStatusRunning)
+
+		hasKubevirt, hasConflict, err := checkVolumePolicies(vm, backup, newTestLogger(), &stubVolumeHelper{})
+
+		require.NoError(t, err)
+		assert.False(t, hasKubevirt)
+		assert.False(t, hasConflict)
+	})
+
+	t.Run("PVC not found is skipped", func(t *testing.T) {
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "missing-pvc")
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset())
+
+		hasKubevirt, hasConflict, err := checkVolumePolicies(vm, backup, newTestLogger(), &stubVolumeHelper{})
+
+		require.NoError(t, err)
+		assert.False(t, hasKubevirt)
+		assert.False(t, hasConflict)
+	})
+
+	t.Run("core client Get error propagates", func(t *testing.T) {
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		fakeCore := k8sfake.NewSimpleClientset()
+		fakeCore.PrependReactor("get", "persistentvolumeclaims", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, fmt.Errorf("simulated get failure")
+		})
+		withFakeCoreClient(t, fakeCore)
+
+		_, _, err := checkVolumePolicies(vm, backup, newTestLogger(), &stubVolumeHelper{})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "simulated get failure")
+	})
+
+	t.Run("snapshot policy sets hasConflictingPolicy", func(t *testing.T) {
+		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Namespace: testNamespace}}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset(pvc))
+
+		vh := &stubVolumeHelper{shouldSnapshot: map[string]bool{"pvc-1": true}}
+		hasKubevirt, hasConflict, err := checkVolumePolicies(vm, backup, newTestLogger(), vh)
+
+		require.NoError(t, err)
+		assert.False(t, hasKubevirt)
+		assert.True(t, hasConflict)
+	})
+
+	t.Run("custom kubevirt policy sets hasKubevirtPolicy", func(t *testing.T) {
+		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Namespace: testNamespace}}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset(pvc))
+
+		vh := &stubVolumeHelper{shouldCustom: map[string]bool{"pvc-1": true}}
+		hasKubevirt, hasConflict, err := checkVolumePolicies(vm, backup, newTestLogger(), vh)
+
+		require.NoError(t, err)
+		assert.True(t, hasKubevirt)
+		assert.False(t, hasConflict)
+	})
+
+	t.Run("ShouldPerformSnapshot error propagates", func(t *testing.T) {
+		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Namespace: testNamespace}}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset(pvc))
+
+		vh := &stubVolumeHelper{shouldSnapshotErr: map[string]error{"pvc-1": fmt.Errorf("policy check boom")}}
+		_, _, err := checkVolumePolicies(vm, backup, newTestLogger(), vh)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "policy check boom")
+	})
+
+	t.Run("ShouldPerformCustomAction error propagates", func(t *testing.T) {
+		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Namespace: testNamespace}}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset(pvc))
+
+		vh := &stubVolumeHelper{shouldCustomErr: map[string]error{"pvc-1": fmt.Errorf("custom check boom")}}
+		_, _, err := checkVolumePolicies(vm, backup, newTestLogger(), vh)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "custom check boom")
+	})
+}
+
+func TestBackupPlugin_getFirstKubevirtPVC(t *testing.T) {
+	backup := &velerov1.Backup{ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"}}
+
+	t.Run("no PVCs", func(t *testing.T) {
+		plugin := &BackupPlugin{Log: newTestLogger()}
+		vm := createTestVM(testNamespace, testVMName, kvcore.VirtualMachineStatusRunning)
+
+		_, err := plugin.getFirstKubevirtPVC(vm, backup, &stubVolumeHelper{})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no PVCs found")
+	})
+
+	t.Run("skips not-found PVC and returns first match", func(t *testing.T) {
+		plugin := &BackupPlugin{Log: newTestLogger()}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "missing-pvc", "pvc-2")
+		pvc2 := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-2", Namespace: testNamespace}}
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset(pvc2))
+
+		vh := &stubVolumeHelper{shouldCustom: map[string]bool{"pvc-2": true}}
+		result, err := plugin.getFirstKubevirtPVC(vm, backup, vh)
+
+		require.NoError(t, err)
+		assert.Equal(t, "pvc-2", result.Name)
+	})
+
+	t.Run("get error propagates", func(t *testing.T) {
+		plugin := &BackupPlugin{Log: newTestLogger()}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		fakeCore := k8sfake.NewSimpleClientset()
+		fakeCore.PrependReactor("get", "persistentvolumeclaims", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, fmt.Errorf("simulated get failure")
+		})
+		withFakeCoreClient(t, fakeCore)
+
+		_, err := plugin.getFirstKubevirtPVC(vm, backup, &stubVolumeHelper{})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "simulated get failure")
+	})
+
+	t.Run("ShouldPerformCustomAction error propagates", func(t *testing.T) {
+		plugin := &BackupPlugin{Log: newTestLogger()}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Namespace: testNamespace}}
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset(pvc))
+
+		vh := &stubVolumeHelper{shouldCustomErr: map[string]error{"pvc-1": fmt.Errorf("custom check boom")}}
+		_, err := plugin.getFirstKubevirtPVC(vm, backup, vh)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "custom check boom")
+	})
+
+	t.Run("no PVC eligible", func(t *testing.T) {
+		plugin := &BackupPlugin{Log: newTestLogger()}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Namespace: testNamespace}}
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset(pvc))
+
+		_, err := plugin.getFirstKubevirtPVC(vm, backup, &stubVolumeHelper{})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no PVC eligible")
+	})
 }
 
 func getFakeClient() crclient.Client {
@@ -1138,6 +1358,157 @@ func TestBackupPlugin_Cancel_NotFound(t *testing.T) {
 
 	err := plugin.Cancel("missing-op", backup)
 	assert.NoError(t, err)
+}
+
+func TestBackupPlugin_getDataUploadByOperationID(t *testing.T) {
+	backup := &velerov1.Backup{ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"}}
+
+	t.Run("finds the matching DataUpload among several sharing the backup label", func(t *testing.T) {
+		const wantOperationID = "op-match"
+		match := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "du-match",
+				Namespace: backup.Namespace,
+				Labels:    map[string]string{velerov1.BackupNameLabel: controllercommon.SafeLabelValue(backup.Name)},
+				Annotations: map[string]string{
+					controllercommon.AnnotationOperationID: wantOperationID,
+				},
+			},
+		}
+		decoy := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "du-decoy",
+				Namespace: backup.Namespace,
+				Labels:    map[string]string{velerov1.BackupNameLabel: controllercommon.SafeLabelValue(backup.Name)},
+				Annotations: map[string]string{
+					controllercommon.AnnotationOperationID: "op-other",
+				},
+			},
+		}
+
+		fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, match), dataUploadUnstructured(t, decoy))
+		withFakeDynamicClient(t, fakeDynamic)
+
+		plugin := &BackupPlugin{Log: newTestLogger()}
+
+		result, err := plugin.getDataUploadByOperationID(wantOperationID, backup)
+
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Equal(t, "du-match", result.Name)
+	})
+
+	t.Run("returns nil, nil when no DataUpload matches", func(t *testing.T) {
+		fakeDynamic := newDataUploadDynamicClient(t)
+		withFakeDynamicClient(t, fakeDynamic)
+
+		plugin := &BackupPlugin{Log: newTestLogger()}
+
+		result, err := plugin.getDataUploadByOperationID("no-such-op", backup)
+
+		require.NoError(t, err)
+		assert.Nil(t, result)
+	})
+
+	t.Run("propagates a List error", func(t *testing.T) {
+		fakeDynamic := newDataUploadDynamicClient(t)
+		fakeDynamic.PrependReactor("list", "datauploads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, fmt.Errorf("simulated list failure")
+		})
+		withFakeDynamicClient(t, fakeDynamic)
+
+		plugin := &BackupPlugin{Log: newTestLogger()}
+
+		_, err := plugin.getDataUploadByOperationID("op-1", backup)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "simulated list failure")
+	})
+}
+
+func TestBackupPlugin_patchDataUploadCancel(t *testing.T) {
+	t.Run("patches only spec.cancel, leaving status and other spec fields untouched", func(t *testing.T) {
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: "du-patch", Namespace: "velero"},
+			Spec:       velerov2alpha1.DataUploadSpec{Cancel: false, BackupStorageLocation: "my-bsl"},
+			Status: velerov2alpha1.DataUploadStatus{
+				Phase:   velerov2alpha1.DataUploadPhaseInProgress,
+				Message: "controller-owned status",
+			},
+		}
+		fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, du))
+		withFakeDynamicClient(t, fakeDynamic)
+
+		plugin := &BackupPlugin{Log: newTestLogger()}
+
+		err := plugin.patchDataUploadCancel(du.Namespace, du.Name, true)
+		require.NoError(t, err)
+
+		gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
+		updated, err := fakeDynamic.Resource(gvr).Namespace(du.Namespace).Get(context.Background(), du.Name, metav1.GetOptions{})
+		require.NoError(t, err)
+		updatedDU := &velerov2alpha1.DataUpload{}
+		require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(updated.Object, updatedDU))
+
+		assert.True(t, updatedDU.Spec.Cancel)
+		assert.Equal(t, "my-bsl", updatedDU.Spec.BackupStorageLocation)
+		assert.Equal(t, velerov2alpha1.DataUploadPhaseInProgress, updatedDU.Status.Phase)
+		assert.Equal(t, "controller-owned status", updatedDU.Status.Message)
+	})
+
+	t.Run("does not retry a NotFound patch", func(t *testing.T) {
+		withFastCancelBackoff(t)
+
+		fakeDynamic := newDataUploadDynamicClient(t)
+		attempts := 0
+		fakeDynamic.PrependReactor("patch", "datauploads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			attempts++
+			return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: "velero.io", Resource: "datauploads"}, "missing-du")
+		})
+		withFakeDynamicClient(t, fakeDynamic)
+
+		plugin := &BackupPlugin{Log: newTestLogger()}
+
+		err := plugin.patchDataUploadCancel("velero", "missing-du", true)
+
+		require.Error(t, err)
+		assert.Equal(t, 1, attempts, "a NotFound patch error is not transient and must not be retried")
+	})
+
+	t.Run("retries a transient patch failure", func(t *testing.T) {
+		withFastCancelBackoff(t)
+
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: "du-patch-retry", Namespace: "velero"},
+			Spec:       velerov2alpha1.DataUploadSpec{Cancel: false},
+		}
+		fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, du))
+		attempts := 0
+		fakeDynamic.PrependReactor("patch", "datauploads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			attempts++
+			if attempts < 2 {
+				return true, nil, fmt.Errorf("simulated transient patch failure")
+			}
+			// Unhandled: let the request fall through to the tracker's default
+			// reactor, which actually applies the patch.
+			return false, nil, nil
+		})
+		withFakeDynamicClient(t, fakeDynamic)
+
+		plugin := &BackupPlugin{Log: newTestLogger()}
+
+		err := plugin.patchDataUploadCancel(du.Namespace, du.Name, true)
+
+		require.NoError(t, err, "a transient patch error must be retried via cancelPatchBackoff")
+		assert.Equal(t, 2, attempts)
+
+		gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
+		updated, err := fakeDynamic.Resource(gvr).Namespace(du.Namespace).Get(context.Background(), du.Name, metav1.GetOptions{})
+		require.NoError(t, err)
+		updatedDU := &velerov2alpha1.DataUpload{}
+		require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(updated.Object, updatedDU))
+		assert.True(t, updatedDU.Spec.Cancel)
+	})
 }
 
 func TestGenerateOperationID(t *testing.T) {
