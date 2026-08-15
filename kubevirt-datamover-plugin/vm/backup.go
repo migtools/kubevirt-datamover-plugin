@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -64,6 +65,45 @@ type BackupPlugin struct {
 	Log               logrus.FieldLogger
 	pluginPVCPodCache PluginPVCPodCache
 	crClient          crclient.Client
+
+	// dynamicClientMu guards dynamicClient. A BackupPlugin instance lives for
+	// the duration of a single backup (mirrors pluginPVCPodCache's caching
+	// precedent above), so the dynamic client -- expensive to bootstrap via
+	// in-cluster config -- only needs to be built once instead of once per
+	// DataUpload API call.
+	dynamicClientMu sync.Mutex
+	dynamicClient   dynamicClientInterface
+}
+
+// dataUploadGVR is the GroupVersionResource for DataUpload custom resources,
+// shared by every dynamic-client call site in this file so the group/version/
+// resource strings only need to be correct in one place.
+var dataUploadGVR = schema.GroupVersionResource{
+	Group:    "velero.io",
+	Version:  "v2alpha1",
+	Resource: "datauploads",
+}
+
+// dataUploadResourceClient returns a dynamic resource client scoped to the
+// DataUpload GVR, bootstrapping (and caching on the plugin instance) the
+// underlying dynamic client on first use.
+func (p *BackupPlugin) dataUploadResourceClient() (dynamic.NamespaceableResourceInterface, error) {
+	p.dynamicClientMu.Lock()
+	defer p.dynamicClientMu.Unlock()
+
+	if p.dynamicClient == nil {
+		config, err := clients.GetInClusterConfig()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
+		}
+		dynamicClient, err := getDynamicClient(config)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get dynamic client: %w", err)
+		}
+		p.dynamicClient = dynamicClient
+	}
+
+	return p.dynamicClient.Resource(dataUploadGVR), nil
 }
 
 type PluginPVCPodCache struct {
@@ -291,11 +331,8 @@ func (p *BackupPlugin) Cancel(operationID string, backup *velerov1.Backup) error
 		return nil
 	}
 
-	// Set cancel flag on DataUpload
-	dataUpload.Spec.Cancel = true
-
-	// Update the DataUpload
-	if err := p.updateDataUpload(dataUpload); err != nil {
+	// Patch the cancel flag on the DataUpload
+	if err := p.patchDataUploadCancel(dataUpload.Namespace, dataUpload.Name, true); err != nil {
 		return fmt.Errorf("failed to update DataUpload for cancellation: %w", err)
 	}
 
@@ -478,6 +515,28 @@ func (p *BackupPlugin) getFirstKubevirtPVC(vm *kvcore.VirtualMachine, backup *ve
 	return nil, fmt.Errorf("no PVC eligible for kubevirt datamover found for VirtualMachine %s/%s", vm.Namespace, vm.Name)
 }
 
+// maxOperationTimeout bounds the effective DataUpload operation timeout
+// regardless of what the Backup requests: without a ceiling, a misconfigured
+// ItemOperationTimeout could keep an operation -- and the resources backing
+// it (upload pod, scratch PVC) -- alive far longer than any real transfer
+// should reasonably take.
+const maxOperationTimeout = 24 * time.Hour
+
+// maxCreateAttempts bounds retries of the create-or-adopt loop in
+// createDataUpload for the narrow double-race case: Create() reports
+// AlreadyExists, but the object is already gone again by the time we
+// re-fetch it (something else deleted it in between). A small bounded retry
+// lets the create win on a subsequent attempt instead of erroring out on a
+// transient race.
+const maxCreateAttempts = 3
+
+// createRetryBackoffUnit scales the delay between double-race create
+// retries (attempt * createRetryBackoffUnit): a bare immediate retry would
+// hammer the API server back-to-back for a race that, by definition, needs
+// another actor's Create/Delete to land in between attempts. A var (not a
+// const) so tests can shrink it to avoid paying the real delay.
+var createRetryBackoffUnit = 100 * time.Millisecond
+
 // createDataUpload creates a DataUpload CR for the kubevirt datamover.
 func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *velerov1.Backup, operationID string, sourcePVC *corev1.PersistentVolumeClaim) (*velerov2alpha1.DataUpload, error) {
 	dataUploadName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
@@ -487,6 +546,11 @@ func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *veler
 	operationTimeout := metav1.Duration{Duration: 4 * time.Hour}
 	if backup.Spec.ItemOperationTimeout.Duration > 0 {
 		operationTimeout = backup.Spec.ItemOperationTimeout
+	}
+	if operationTimeout.Duration > maxOperationTimeout {
+		p.Log.Warnf("[vm-backup] ItemOperationTimeout %s exceeds the maximum of %s, capping it",
+			operationTimeout.Duration, maxOperationTimeout)
+		operationTimeout.Duration = maxOperationTimeout
 	}
 
 	dataUpload := &velerov2alpha1.DataUpload{
@@ -528,82 +592,120 @@ func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *veler
 		},
 	}
 
-	// Create the DataUpload using the Velero client
-	if err := p.createDataUploadResource(dataUpload); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return nil, fmt.Errorf("failed to create DataUpload resource: %w", err)
+	var lastRaceErr error
+	for attempt := 1; attempt <= maxCreateAttempts; attempt++ {
+		// Create the DataUpload using the Velero client
+		if err := p.createDataUploadResource(dataUpload); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return nil, fmt.Errorf("failed to create DataUpload resource: %w", err)
+			}
+			// A DataUpload with this deterministic name already exists: a prior
+			// Execute() call for this same (backup, VM) must have created it, and
+			// Velero re-invoked us (e.g. after a transient RPC error). Adopt it
+			// instead of erroring, but only after confirming it actually targets the
+			// same source PVC we were about to create it for -- a name collision
+			// against something else (shouldn't happen given the hash, but cheap to
+			// check) must not be silently treated as "our" operation.
+			existing, getErr := p.getDataUploadByName(dataUploadName, backup.Namespace)
+			if getErr != nil {
+				if apierrors.IsNotFound(getErr) {
+					// Double-race: something else's Create() is what triggered our
+					// AlreadyExists above, but that object is already gone again by
+					// the time we re-fetch it (e.g. deleted concurrently). Retry the
+					// whole create instead of erroring out on a state that's likely
+					// to resolve itself within a couple of attempts.
+					lastRaceErr = getErr
+					if attempt < maxCreateAttempts {
+						time.Sleep(time.Duration(attempt) * createRetryBackoffUnit)
+					}
+					continue
+				}
+				return nil, fmt.Errorf("DataUpload %s/%s already exists but could not be re-fetched: %w", backup.Namespace, dataUploadName, getErr)
+			}
+			if err := p.validateAdoptableDataUpload(existing, vm, backup, sourcePVC); err != nil {
+				return nil, err
+			}
+			p.Log.Infof("[vm-backup] DataUpload %s/%s already exists for this backup+VM, reusing it instead of creating a duplicate",
+				backup.Namespace, dataUploadName)
+			return existing, nil
 		}
-		// A DataUpload with this deterministic name already exists: a prior
-		// Execute() call for this same (backup, VM) must have created it, and
-		// Velero re-invoked us (e.g. after a transient RPC error). Adopt it
-		// instead of erroring, but only after confirming it actually targets the
-		// same source PVC we were about to create it for -- a name collision
-		// against something else (shouldn't happen given the hash, but cheap to
-		// check) must not be silently treated as "our" operation.
-		existing, getErr := p.getDataUploadByName(dataUploadName, backup.Namespace)
-		if getErr != nil {
-			return nil, fmt.Errorf("DataUpload %s/%s already exists but could not be re-fetched: %w", backup.Namespace, dataUploadName, getErr)
-		}
-		if existing.Spec.SourcePVC != sourcePVC.Name || existing.Spec.SourceNamespace != vm.Namespace {
-			return nil, fmt.Errorf("existing DataUpload %s/%s targets %s/%s, not %s/%s -- refusing to reuse it",
-				backup.Namespace, dataUploadName, existing.Spec.SourceNamespace, existing.Spec.SourcePVC, vm.Namespace, sourcePVC.Name)
-		}
-		if !hasOwnerUID(existing.OwnerReferences, backup.UID) {
-			// The name hash includes backup.Name but not backup.UID: a deleted
-			// and recreated Backup with the same name (unusual, but not
-			// impossible) would otherwise let this stale object from a prior
-			// Backup be silently adopted as if it belonged to the current one.
-			return nil, fmt.Errorf("existing DataUpload %s/%s is not owned by Backup %s (UID %s) -- refusing to reuse it",
-				backup.Namespace, dataUploadName, backup.Name, backup.UID)
-		}
-		if existing.Annotations[controllercommon.AnnotationOperationID] == "" {
-			// Without this annotation, Execute() would fall back to the locally
-			// generated operationID, but getDataUploadByOperationID (used by
-			// Progress/Cancel) requires an exact annotation match to that ID --
-			// an existing object with none would never be found again, silently
-			// stranding this operation instead of tracking it.
-			return nil, fmt.Errorf("existing DataUpload %s/%s has no %s annotation; refusing to reuse it since progress and cancellation could not track it",
-				backup.Namespace, dataUploadName, controllercommon.AnnotationOperationID)
-		}
-		if want := controllercommon.SafeLabelValue(backup.Name); existing.Labels[velerov1.BackupNameLabel] != want {
-			// getDataUploadByOperationID narrows server-side via this label
-			// before its annotation re-check, so an object missing it (or with
-			// a divergent value) would be unfindable even though the
-			// annotation above matches.
-			return nil, fmt.Errorf("existing DataUpload %s/%s has label %s=%q, expected %q; refusing to reuse it since progress and cancellation could not find it",
-				backup.Namespace, dataUploadName, velerov1.BackupNameLabel, existing.Labels[velerov1.BackupNameLabel], want)
-		}
-		p.Log.Infof("[vm-backup] DataUpload %s/%s already exists for this backup+VM, reusing it instead of creating a duplicate",
-			backup.Namespace, dataUploadName)
-		return existing, nil
+
+		return dataUpload, nil
 	}
 
-	return dataUpload, nil
+	return nil, fmt.Errorf("failed to create DataUpload %s/%s after %d attempts (concurrent create/delete race): %w",
+		backup.Namespace, dataUploadName, maxCreateAttempts, lastRaceErr)
+}
+
+// validateAdoptableDataUpload checks whether existing (a DataUpload found
+// under the deterministic name createDataUpload was about to create) may
+// safely be adopted in place of creating a new one. A name collision against
+// something else (shouldn't happen given the name hash, but cheap to check)
+// must not be silently treated as "our" operation.
+func (p *BackupPlugin) validateAdoptableDataUpload(existing *velerov2alpha1.DataUpload, vm *kvcore.VirtualMachine, backup *velerov1.Backup, sourcePVC *corev1.PersistentVolumeClaim) error {
+	dataUploadName := existing.Name
+
+	if existing.Spec.SourcePVC != sourcePVC.Name || existing.Spec.SourceNamespace != vm.Namespace {
+		return fmt.Errorf("existing DataUpload %s/%s targets %s/%s, not %s/%s -- refusing to reuse it",
+			backup.Namespace, dataUploadName, existing.Spec.SourceNamespace, existing.Spec.SourcePVC, vm.Namespace, sourcePVC.Name)
+	}
+	if !hasOwnerUID(existing.OwnerReferences, backup.UID) {
+		// The name hash includes backup.Name but not backup.UID: a deleted
+		// and recreated Backup with the same name (unusual, but not
+		// impossible) would otherwise let this stale object from a prior
+		// Backup be silently adopted as if it belonged to the current one.
+		return fmt.Errorf("existing DataUpload %s/%s is not owned by Backup %s (UID %s) -- refusing to reuse it",
+			backup.Namespace, dataUploadName, backup.Name, backup.UID)
+	}
+	if existing.Annotations[controllercommon.AnnotationVMName] != vm.Name || existing.Annotations[controllercommon.AnnotationVMNamespace] != vm.Namespace {
+		// SourcePVC/SourceNamespace above identify the disk being backed
+		// up, but not which VM it was resolved for; without this check a
+		// same-named PVC backed up from a different VM (unlikely given the
+		// name hash, but cheap to verify) could be silently adopted as if
+		// it belonged to this one.
+		return fmt.Errorf("existing DataUpload %s/%s has VM identity %s/%s, not %s/%s -- refusing to reuse it",
+			backup.Namespace, dataUploadName, existing.Annotations[controllercommon.AnnotationVMNamespace], existing.Annotations[controllercommon.AnnotationVMName], vm.Namespace, vm.Name)
+	}
+	if existing.Spec.DataMover != controllercommon.DataMoverKubeVirt {
+		return fmt.Errorf("existing DataUpload %s/%s uses data mover %q, not %q -- refusing to reuse it",
+			backup.Namespace, dataUploadName, existing.Spec.DataMover, controllercommon.DataMoverKubeVirt)
+	}
+	if existing.Spec.BackupStorageLocation != backup.Spec.StorageLocation {
+		return fmt.Errorf("existing DataUpload %s/%s uses backup storage location %q, not %q -- refusing to reuse it",
+			backup.Namespace, dataUploadName, existing.Spec.BackupStorageLocation, backup.Spec.StorageLocation)
+	}
+	if existing.Annotations[controllercommon.AnnotationOperationID] == "" {
+		// Without this annotation, Execute() would fall back to the locally
+		// generated operationID, but getDataUploadByOperationID (used by
+		// Progress/Cancel) requires an exact annotation match to that ID --
+		// an existing object with none would never be found again, silently
+		// stranding this operation instead of tracking it.
+		return fmt.Errorf("existing DataUpload %s/%s has no %s annotation; refusing to reuse it since progress and cancellation could not track it",
+			backup.Namespace, dataUploadName, controllercommon.AnnotationOperationID)
+	}
+	if want := controllercommon.SafeLabelValue(backup.Name); existing.Labels[velerov1.BackupNameLabel] != want {
+		// getDataUploadByOperationID narrows server-side via this label
+		// before its annotation re-check, so an object missing it (or with
+		// a divergent value) would be unfindable even though the
+		// annotation above matches.
+		return fmt.Errorf("existing DataUpload %s/%s has label %s=%q, expected %q; refusing to reuse it since progress and cancellation could not find it",
+			backup.Namespace, dataUploadName, velerov1.BackupNameLabel, existing.Labels[velerov1.BackupNameLabel], want)
+	}
+	return nil
 }
 
 // getDataUploadByName fetches a single DataUpload by name, used to adopt an
 // existing one when createDataUploadResource reports AlreadyExists.
 func (p *BackupPlugin) getDataUploadByName(name, namespace string) (*velerov2alpha1.DataUpload, error) {
-	config, err := clients.GetInClusterConfig()
+	resourceClient, err := p.dataUploadResourceClient()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
-	}
-
-	dynamicClient, err := getDynamicClient(config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get dynamic client: %w", err)
-	}
-
-	gvr := schema.GroupVersionResource{
-		Group:    "velero.io",
-		Version:  "v2alpha1",
-		Resource: "datauploads",
+		return nil, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
 	defer cancel()
 
-	item, err := dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	item, err := resourceClient.Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get DataUpload: %w", err)
 	}
@@ -617,11 +719,6 @@ func (p *BackupPlugin) getDataUploadByName(name, namespace string) (*velerov2alp
 
 // createDataUploadResource creates the DataUpload CR in the cluster.
 func (p *BackupPlugin) createDataUploadResource(du *velerov2alpha1.DataUpload) error {
-	config, err := clients.GetInClusterConfig()
-	if err != nil {
-		return fmt.Errorf("failed to get in-cluster config: %w", err)
-	}
-
 	// Create unstructured client for DataUpload
 	duMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(du)
 	if err != nil {
@@ -635,22 +732,15 @@ func (p *BackupPlugin) createDataUploadResource(du *velerov2alpha1.DataUpload) e
 		Kind:    "DataUpload",
 	})
 
-	// Use dynamic client to create the resource
-	dynamicClient, err := getDynamicClient(config)
+	resourceClient, err := p.dataUploadResourceClient()
 	if err != nil {
-		return fmt.Errorf("failed to get dynamic client: %w", err)
-	}
-
-	gvr := schema.GroupVersionResource{
-		Group:    "velero.io",
-		Version:  "v2alpha1",
-		Resource: "datauploads",
+		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
 	defer cancel()
 
-	_, err = dynamicClient.Resource(gvr).Namespace(du.Namespace).Create(
+	_, err = resourceClient.Namespace(du.Namespace).Create(
 		ctx,
 		unstructuredDU,
 		metav1.CreateOptions{},
@@ -664,27 +754,16 @@ func (p *BackupPlugin) createDataUploadResource(du *velerov2alpha1.DataUpload) e
 
 // getDataUploadByOperationID retrieves a DataUpload by its operation ID.
 func (p *BackupPlugin) getDataUploadByOperationID(operationID string, backup *velerov1.Backup) (*velerov2alpha1.DataUpload, error) {
-	config, err := clients.GetInClusterConfig()
+	resourceClient, err := p.dataUploadResourceClient()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
-	}
-
-	dynamicClient, err := getDynamicClient(config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get dynamic client: %w", err)
-	}
-
-	gvr := schema.GroupVersionResource{
-		Group:    "velero.io",
-		Version:  "v2alpha1",
-		Resource: "datauploads",
+		return nil, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
 	defer cancel()
 
 	// List DataUploads in the backup namespace with matching label
-	list, err := dynamicClient.Resource(gvr).Namespace(backup.Namespace).List(
+	list, err := resourceClient.Namespace(backup.Namespace).List(
 		ctx,
 		metav1.ListOptions{
 			LabelSelector: fmt.Sprintf("%s=%s", velerov1.BackupNameLabel, controllercommon.SafeLabelValue(backup.Name)),
@@ -762,36 +841,28 @@ var cancelPatchBackoff = wait.Backoff{
 // reasonably take.
 const cancelPatchTotalTimeout = 45 * time.Second
 
-// updateDataUpload patches the DataUpload's Spec.Cancel field in the cluster.
-// A scoped merge patch (rather than a full Update of the locally-fetched object)
-// is used deliberately: the kubevirt datamover controller concurrently
-// reconciles this same DataUpload and updates its Status via a full object
-// Update, so replacing the whole object from a possibly-stale local copy risks
-// clobbering the controller's in-flight status changes.
-func (p *BackupPlugin) updateDataUpload(du *velerov2alpha1.DataUpload) error {
-	config, err := clients.GetInClusterConfig()
+// patchDataUploadCancel patches the named DataUpload's Spec.Cancel field in
+// the cluster. A scoped merge patch (rather than a full Update of a
+// locally-fetched object) is used deliberately: the kubevirt datamover
+// controller concurrently reconciles this same DataUpload and updates its
+// Status via a full object Update, so replacing the whole object from a
+// possibly-stale local copy risks clobbering the controller's in-flight
+// status changes. Taking just namespace/name/cancel (rather than the whole
+// *velerov2alpha1.DataUpload) makes that impossible by construction, since
+// there is no local copy of Status to accidentally include.
+func (p *BackupPlugin) patchDataUploadCancel(namespace, name string, cancel bool) error {
+	resourceClient, err := p.dataUploadResourceClient()
 	if err != nil {
-		return fmt.Errorf("failed to get in-cluster config: %w", err)
-	}
-
-	dynamicClient, err := getDynamicClient(config)
-	if err != nil {
-		return fmt.Errorf("failed to get dynamic client: %w", err)
+		return err
 	}
 
 	patch, err := json.Marshal(map[string]interface{}{
 		"spec": map[string]interface{}{
-			"cancel": du.Spec.Cancel,
+			"cancel": cancel,
 		},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to build DataUpload cancel patch: %w", err)
-	}
-
-	gvr := schema.GroupVersionResource{
-		Group:    "velero.io",
-		Version:  "v2alpha1",
-		Resource: "datauploads",
 	}
 
 	parentCtx, cancelParent := context.WithTimeout(context.Background(), cancelPatchTotalTimeout)
@@ -804,9 +875,9 @@ func (p *BackupPlugin) updateDataUpload(du *velerov2alpha1.DataUpload) error {
 	}, func() error {
 		ctx, cancel := context.WithTimeout(parentCtx, apiCallTimeout)
 		defer cancel()
-		_, patchErr := dynamicClient.Resource(gvr).Namespace(du.Namespace).Patch(
+		_, patchErr := resourceClient.Namespace(namespace).Patch(
 			ctx,
-			du.Name,
+			name,
 			types.MergePatchType,
 			patch,
 			metav1.PatchOptions{},
@@ -948,12 +1019,8 @@ func generateDataUploadName(backupName, namespace, vmName string) string {
 
 // getDynamicClient returns a dynamic client for working with unstructured resources.
 // This variable can be overridden for testing.
-var getDynamicClient = func(config interface{}) (dynamicClientInterface, error) {
-	restConfig, ok := config.(*rest.Config)
-	if !ok {
-		return nil, fmt.Errorf("invalid config type: expected *rest.Config")
-	}
-	return dynamic.NewForConfig(restConfig)
+var getDynamicClient = func(config *rest.Config) (dynamicClientInterface, error) {
+	return dynamic.NewForConfig(config)
 }
 
 // dynamicClientInterface defines the interface for dynamic client operations.
@@ -963,6 +1030,6 @@ type dynamicClientInterface interface {
 }
 
 // SetDynamicClientFunc allows overriding the dynamic client creation for testing.
-func SetDynamicClientFunc(fn func(config interface{}) (dynamicClientInterface, error)) {
+func SetDynamicClientFunc(fn func(config *rest.Config) (dynamicClientInterface, error)) {
 	getDynamicClient = fn
 }

@@ -60,6 +60,44 @@ type RestorePlugin struct {
 	// restore -- only needs to be fetched once instead of once per PVC.
 	backupMu     sync.Mutex
 	cachedBackup *velerov1.Backup
+
+	// dynamicClientMu guards dynamicClient. Like cachedBackup above, the
+	// dynamic client -- expensive to bootstrap via in-cluster config -- only
+	// needs to be built once per restore instead of once per DataDownload API
+	// call.
+	dynamicClientMu sync.Mutex
+	dynamicClient   dynamicClientInterface
+}
+
+// dataDownloadGVR is the GroupVersionResource for DataDownload custom
+// resources, shared by every dynamic-client call site in this file so the
+// group/version/resource strings only need to be correct in one place.
+var dataDownloadGVR = schema.GroupVersionResource{
+	Group:    "velero.io",
+	Version:  "v2alpha1",
+	Resource: "datadownloads",
+}
+
+// dataDownloadResourceClient returns a dynamic resource client scoped to the
+// DataDownload GVR, bootstrapping (and caching on the plugin instance) the
+// underlying dynamic client on first use.
+func (p *RestorePlugin) dataDownloadResourceClient() (dynamic.NamespaceableResourceInterface, error) {
+	p.dynamicClientMu.Lock()
+	defer p.dynamicClientMu.Unlock()
+
+	if p.dynamicClient == nil {
+		config, err := clients.GetInClusterConfig()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
+		}
+		dynamicClient, err := getDynamicClient(config)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get dynamic client: %w", err)
+		}
+		p.dynamicClient = dynamicClient
+	}
+
+	return p.dynamicClient.Resource(dataDownloadGVR), nil
 }
 
 // apiCallTimeout bounds each individual Kubernetes API call made by this
@@ -346,9 +384,7 @@ func (p *RestorePlugin) Cancel(operationID string, restore *velerov1.Restore) er
 		return nil
 	}
 
-	dataDownload.Spec.Cancel = true
-
-	if err := p.updateDataDownload(dataDownload); err != nil {
+	if err := p.patchDataDownloadCancel(dataDownload.Namespace, dataDownload.Name, true); err != nil {
 		return fmt.Errorf("failed to update DataDownload for cancellation: %w", err)
 	}
 
@@ -386,6 +422,28 @@ func (p *RestorePlugin) getBackup(restore *velerov1.Restore) (*velerov1.Backup, 
 	return backup, nil
 }
 
+// maxOperationTimeout bounds the effective DataDownload operation timeout
+// regardless of what the Restore requests: without a ceiling, a
+// misconfigured ItemOperationTimeout could keep an operation -- and the
+// resources backing it (downloader pod, scratch PVC) -- alive far longer
+// than any real transfer should reasonably take.
+const maxOperationTimeout = 24 * time.Hour
+
+// maxCreateAttempts bounds retries of the create-or-adopt loop in
+// createDataDownload for the narrow double-race case: Create() reports
+// AlreadyExists, but the object is already gone again by the time we
+// re-fetch it (something else deleted it in between). A small bounded retry
+// lets the create win on a subsequent attempt instead of erroring out on a
+// transient race.
+const maxCreateAttempts = 3
+
+// createRetryBackoffUnit scales the delay between double-race create
+// retries (attempt * createRetryBackoffUnit): a bare immediate retry would
+// hammer the API server back-to-back for a race that, by definition, needs
+// another actor's Create/Delete to land in between attempts. A var (not a
+// const) so tests can shrink it to avoid paying the real delay.
+var createRetryBackoffUnit = 100 * time.Millisecond
+
 // createDataDownload creates a DataDownload CR for the kubevirt datamover.
 func (p *RestorePlugin) createDataDownload(
 	restore *velerov1.Restore,
@@ -398,6 +456,11 @@ func (p *RestorePlugin) createDataDownload(
 	operationTimeout := metav1.Duration{Duration: 4 * time.Hour}
 	if restore.Spec.ItemOperationTimeout.Duration > 0 {
 		operationTimeout = restore.Spec.ItemOperationTimeout
+	}
+	if operationTimeout.Duration > maxOperationTimeout {
+		p.Log.Warnf("[pvc-restore] ItemOperationTimeout %s exceeds the maximum of %s, capping it",
+			operationTimeout.Duration, maxOperationTimeout)
+		operationTimeout.Duration = maxOperationTimeout
 	}
 
 	dataDownload := &velerov2alpha1.DataDownload{
@@ -463,104 +526,137 @@ func (p *RestorePlugin) createDataDownload(
 		},
 	}
 
-	if err := p.createDataDownloadResource(dataDownload); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return nil, fmt.Errorf("failed to create DataDownload resource: %w", err)
-		}
-		// A DataDownload with this deterministic name already exists: a prior
-		// Execute() call for this same (restore, PVC) must have created it, and
-		// Velero re-invoked us (e.g. after a transient RPC error). Adopt it
-		// instead of erroring, but only after confirming it actually targets the
-		// same PVC/namespace we were about to create it for -- a name collision
-		// against something else (shouldn't happen given the hash, but cheap to
-		// check) must not be silently treated as "our" operation.
-		existing, getErr := p.getDataDownloadByName(dataDownloadName, restore.Namespace)
-		if getErr != nil {
-			return nil, fmt.Errorf("DataDownload %s/%s already exists but could not be re-fetched: %w", restore.Namespace, dataDownloadName, getErr)
-		}
-		if existing.Spec.TargetVolume.PVC != pvc.Name || existing.Spec.TargetVolume.Namespace != targetNamespace {
-			return nil, fmt.Errorf("existing DataDownload %s/%s targets %s/%s, not %s/%s -- refusing to reuse it",
-				restore.Namespace, dataDownloadName, existing.Spec.TargetVolume.Namespace, existing.Spec.TargetVolume.PVC, targetNamespace, pvc.Name)
-		}
-		if !hasOwnerUID(existing.OwnerReferences, restore.UID) {
-			// The name hash includes restore.Name but not restore.UID: a deleted
-			// and recreated Restore with the same name (unusual, but not
-			// impossible) would otherwise let this stale object from a prior
-			// Restore be silently adopted as if it belonged to the current one.
-			return nil, fmt.Errorf("existing DataDownload %s/%s is not owned by Restore %s (UID %s) -- refusing to reuse it",
-				restore.Namespace, dataDownloadName, restore.Name, restore.UID)
-		}
-		if existing.Spec.SourceNamespace != originalNamespace ||
-			existing.Annotations[controllercommon.AnnotationVMNamespace] != originalNamespace ||
-			existing.Annotations[controllercommon.AnnotationVMName] != vmName {
-			return nil, fmt.Errorf("existing DataDownload %s/%s has source namespace %q / VM %s/%s, not %s/%s -- refusing to reuse it",
-				restore.Namespace, dataDownloadName, existing.Spec.SourceNamespace,
-				existing.Annotations[controllercommon.AnnotationVMNamespace], existing.Annotations[controllercommon.AnnotationVMName],
-				originalNamespace, vmName)
-		}
-		if existing.Spec.DataMover != controllercommon.DataMoverKubeVirt {
-			return nil, fmt.Errorf("existing DataDownload %s/%s uses data mover %q, not %q -- refusing to reuse it",
-				restore.Namespace, dataDownloadName, existing.Spec.DataMover, controllercommon.DataMoverKubeVirt)
-		}
-		if existing.Spec.BackupStorageLocation != backup.Spec.StorageLocation {
-			return nil, fmt.Errorf("existing DataDownload %s/%s uses backup storage location %q, not %q -- refusing to reuse it",
-				restore.Namespace, dataDownloadName, existing.Spec.BackupStorageLocation, backup.Spec.StorageLocation)
-		}
-		if existing.Annotations[controllercommon.AnnotationOperationID] == "" {
-			// Without this annotation, Execute() would fall back to the locally
-			// generated operationID, but getDataDownloadByOperationID (used by
-			// Progress/Cancel) requires an exact annotation match to that ID --
-			// an existing object with none would never be found again, silently
-			// stranding this operation instead of tracking it.
-			return nil, fmt.Errorf("existing DataDownload %s/%s has no %s annotation; refusing to reuse it since progress and cancellation could not track it",
-				restore.Namespace, dataDownloadName, controllercommon.AnnotationOperationID)
-		}
-		// getDataDownloadByOperationID narrows server-side with these three
-		// labels before its annotation re-check, so a missing or divergent
-		// label would make the object unfindable even though the annotation
-		// above matches.
-		wantLabels := map[string]string{
-			controllercommon.LabelVeleroBackupName:  controllercommon.SafeLabelValue(restore.Spec.BackupName),
-			controllercommon.LabelVeleroRestoreName: controllercommon.SafeLabelValue(restore.Name),
-			controllercommon.AnnotationOperationID:  controllercommon.SafeLabelValue(existing.Annotations[controllercommon.AnnotationOperationID]),
-		}
-		for key, want := range wantLabels {
-			if existing.Labels[key] != want {
-				return nil, fmt.Errorf("existing DataDownload %s/%s has label %s=%q, expected %q; refusing to reuse it since progress and cancellation could not find it",
-					restore.Namespace, dataDownloadName, key, existing.Labels[key], want)
+	var lastRaceErr error
+	for attempt := 1; attempt <= maxCreateAttempts; attempt++ {
+		if err := p.createDataDownloadResource(dataDownload); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return nil, fmt.Errorf("failed to create DataDownload resource: %w", err)
 			}
+			// A DataDownload with this deterministic name already exists: a prior
+			// Execute() call for this same (restore, PVC) must have created it, and
+			// Velero re-invoked us (e.g. after a transient RPC error). Adopt it
+			// instead of erroring, but only after confirming it actually targets the
+			// same PVC/namespace we were about to create it for -- a name collision
+			// against something else (shouldn't happen given the hash, but cheap to
+			// check) must not be silently treated as "our" operation.
+			existing, getErr := p.getDataDownloadByName(dataDownloadName, restore.Namespace)
+			if getErr != nil {
+				if apierrors.IsNotFound(getErr) {
+					// Double-race: something else's Create() is what triggered our
+					// AlreadyExists above, but that object is already gone again by
+					// the time we re-fetch it (e.g. deleted concurrently). Retry the
+					// whole create instead of erroring out on a state that's likely
+					// to resolve itself within a couple of attempts.
+					lastRaceErr = getErr
+					if attempt < maxCreateAttempts {
+						time.Sleep(time.Duration(attempt) * createRetryBackoffUnit)
+					}
+					continue
+				}
+				return nil, fmt.Errorf("DataDownload %s/%s already exists but could not be re-fetched: %w", restore.Namespace, dataDownloadName, getErr)
+			}
+			if err := p.validateAdoptableDataDownload(existing, restore, backup, pvc, vmName, originalNamespace, targetNamespace); err != nil {
+				return nil, err
+			}
+			p.Log.Infof("[pvc-restore] DataDownload %s/%s already exists for this restore+PVC, reusing it instead of creating a duplicate",
+				restore.Namespace, dataDownloadName)
+			return existing, nil
 		}
-		p.Log.Infof("[pvc-restore] DataDownload %s/%s already exists for this restore+PVC, reusing it instead of creating a duplicate",
-			restore.Namespace, dataDownloadName)
-		return existing, nil
+
+		return dataDownload, nil
 	}
 
-	return dataDownload, nil
+	return nil, fmt.Errorf("failed to create DataDownload %s/%s after %d attempts (concurrent create/delete race): %w",
+		restore.Namespace, dataDownloadName, maxCreateAttempts, lastRaceErr)
+}
+
+// validateAdoptableDataDownload checks whether existing (a DataDownload
+// found under the deterministic name createDataDownload was about to create)
+// may safely be adopted in place of creating a new one. A name collision
+// against something else (shouldn't happen given the name hash, but cheap to
+// check) must not be silently treated as "our" operation.
+func (p *RestorePlugin) validateAdoptableDataDownload(
+	existing *velerov2alpha1.DataDownload,
+	restore *velerov1.Restore,
+	backup *velerov1.Backup,
+	pvc *corev1.PersistentVolumeClaim,
+	vmName, originalNamespace, targetNamespace string,
+) error {
+	dataDownloadName := existing.Name
+
+	if existing.Spec.TargetVolume.PVC != pvc.Name || existing.Spec.TargetVolume.Namespace != targetNamespace {
+		return fmt.Errorf("existing DataDownload %s/%s targets %s/%s, not %s/%s -- refusing to reuse it",
+			restore.Namespace, dataDownloadName, existing.Spec.TargetVolume.Namespace, existing.Spec.TargetVolume.PVC, targetNamespace, pvc.Name)
+	}
+	if !hasOwnerUID(existing.OwnerReferences, restore.UID) {
+		// The name hash includes restore.Name but not restore.UID: a deleted
+		// and recreated Restore with the same name (unusual, but not
+		// impossible) would otherwise let this stale object from a prior
+		// Restore be silently adopted as if it belonged to the current one.
+		return fmt.Errorf("existing DataDownload %s/%s is not owned by Restore %s (UID %s) -- refusing to reuse it",
+			restore.Namespace, dataDownloadName, restore.Name, restore.UID)
+	}
+	if existing.Spec.SourceNamespace != originalNamespace ||
+		existing.Annotations[controllercommon.AnnotationVMNamespace] != originalNamespace ||
+		existing.Annotations[controllercommon.AnnotationVMName] != vmName {
+		return fmt.Errorf("existing DataDownload %s/%s has source namespace %q / VM %s/%s, not %s/%s -- refusing to reuse it",
+			restore.Namespace, dataDownloadName, existing.Spec.SourceNamespace,
+			existing.Annotations[controllercommon.AnnotationVMNamespace], existing.Annotations[controllercommon.AnnotationVMName],
+			originalNamespace, vmName)
+	}
+	if existing.Spec.DataMover != controllercommon.DataMoverKubeVirt {
+		return fmt.Errorf("existing DataDownload %s/%s uses data mover %q, not %q -- refusing to reuse it",
+			restore.Namespace, dataDownloadName, existing.Spec.DataMover, controllercommon.DataMoverKubeVirt)
+	}
+	if existing.Spec.BackupStorageLocation != backup.Spec.StorageLocation {
+		return fmt.Errorf("existing DataDownload %s/%s uses backup storage location %q, not %q -- refusing to reuse it",
+			restore.Namespace, dataDownloadName, existing.Spec.BackupStorageLocation, backup.Spec.StorageLocation)
+	}
+	if existing.Annotations[controllercommon.AnnotationOperationID] == "" {
+		// Without this annotation, Execute() would fall back to the locally
+		// generated operationID, but getDataDownloadByOperationID (used by
+		// Progress/Cancel) requires an exact annotation match to that ID --
+		// an existing object with none would never be found again, silently
+		// stranding this operation instead of tracking it.
+		return fmt.Errorf("existing DataDownload %s/%s has no %s annotation; refusing to reuse it since progress and cancellation could not track it",
+			restore.Namespace, dataDownloadName, controllercommon.AnnotationOperationID)
+	}
+	// getDataDownloadByOperationID narrows server-side with these three
+	// labels before its annotation re-check, so a missing or divergent
+	// label would make the object unfindable even though the annotation
+	// above matches.
+	// Note: the operation-ID entry here is derived from the existing
+	// object's own annotation, not from this call's freshly generated
+	// operationID -- Execute() returns whatever ID is actually stored (see
+	// the comment on returnedOperationID there), so all that matters is
+	// that the object is internally self-consistent between its own label
+	// and its own annotation, not that it matches this specific attempt.
+	wantLabels := map[string]string{
+		controllercommon.LabelVeleroBackupName:  controllercommon.SafeLabelValue(restore.Spec.BackupName),
+		controllercommon.LabelVeleroRestoreName: controllercommon.SafeLabelValue(restore.Name),
+		controllercommon.AnnotationOperationID:  controllercommon.SafeLabelValue(existing.Annotations[controllercommon.AnnotationOperationID]),
+	}
+	for key, want := range wantLabels {
+		if existing.Labels[key] != want {
+			return fmt.Errorf("existing DataDownload %s/%s has label %s=%q, expected %q; refusing to reuse it since progress and cancellation could not find it",
+				restore.Namespace, dataDownloadName, key, existing.Labels[key], want)
+		}
+	}
+	return nil
 }
 
 // getDataDownloadByName fetches a single DataDownload by name, used to adopt
 // an existing one when createDataDownloadResource reports AlreadyExists.
 func (p *RestorePlugin) getDataDownloadByName(name, namespace string) (*velerov2alpha1.DataDownload, error) {
-	config, err := clients.GetInClusterConfig()
+	resourceClient, err := p.dataDownloadResourceClient()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
-	}
-
-	dynamicClient, err := getDynamicClient(config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get dynamic client: %w", err)
-	}
-
-	gvr := schema.GroupVersionResource{
-		Group:    "velero.io",
-		Version:  "v2alpha1",
-		Resource: "datadownloads",
+		return nil, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
 	defer cancel()
 
-	item, err := dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	item, err := resourceClient.Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get DataDownload: %w", err)
 	}
@@ -574,11 +670,6 @@ func (p *RestorePlugin) getDataDownloadByName(name, namespace string) (*velerov2
 
 // createDataDownloadResource creates the DataDownload CR in the cluster.
 func (p *RestorePlugin) createDataDownloadResource(dd *velerov2alpha1.DataDownload) error {
-	config, err := clients.GetInClusterConfig()
-	if err != nil {
-		return fmt.Errorf("failed to get in-cluster config: %w", err)
-	}
-
 	ddMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(dd)
 	if err != nil {
 		return fmt.Errorf("failed to convert DataDownload to unstructured: %w", err)
@@ -591,21 +682,15 @@ func (p *RestorePlugin) createDataDownloadResource(dd *velerov2alpha1.DataDownlo
 		Kind:    "DataDownload",
 	})
 
-	dynamicClient, err := getDynamicClient(config)
+	resourceClient, err := p.dataDownloadResourceClient()
 	if err != nil {
-		return fmt.Errorf("failed to get dynamic client: %w", err)
-	}
-
-	gvr := schema.GroupVersionResource{
-		Group:    "velero.io",
-		Version:  "v2alpha1",
-		Resource: "datadownloads",
+		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
 	defer cancel()
 
-	_, err = dynamicClient.Resource(gvr).Namespace(dd.Namespace).Create(
+	_, err = resourceClient.Namespace(dd.Namespace).Create(
 		ctx,
 		unstructuredDD,
 		metav1.CreateOptions{},
@@ -619,26 +704,15 @@ func (p *RestorePlugin) createDataDownloadResource(dd *velerov2alpha1.DataDownlo
 
 // getDataDownloadByOperationID retrieves a DataDownload by its operation ID.
 func (p *RestorePlugin) getDataDownloadByOperationID(operationID string, restore *velerov1.Restore) (*velerov2alpha1.DataDownload, error) {
-	config, err := clients.GetInClusterConfig()
+	resourceClient, err := p.dataDownloadResourceClient()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
-	}
-
-	dynamicClient, err := getDynamicClient(config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get dynamic client: %w", err)
-	}
-
-	gvr := schema.GroupVersionResource{
-		Group:    "velero.io",
-		Version:  "v2alpha1",
-		Resource: "datadownloads",
+		return nil, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
 	defer cancel()
 
-	list, err := dynamicClient.Resource(gvr).Namespace(restore.Namespace).List(
+	list, err := resourceClient.Namespace(restore.Namespace).List(
 		ctx,
 		metav1.ListOptions{
 			LabelSelector: fmt.Sprintf("%s=%s,%s=%s,%s=%s",
@@ -690,36 +764,28 @@ var cancelPatchBackoff = wait.Backoff{
 // reasonably take.
 const cancelPatchTotalTimeout = 45 * time.Second
 
-// updateDataDownload patches the DataDownload's Spec.Cancel field in the cluster.
-// A scoped merge patch (rather than a full Update of the locally-fetched object) is
-// used deliberately: the kubevirt datamover controller concurrently reconciles this
-// same DataDownload and updates its Status via a full object Update, so replacing
-// the whole object from a possibly-stale local copy risks clobbering the
-// controller's in-flight status changes.
-func (p *RestorePlugin) updateDataDownload(dd *velerov2alpha1.DataDownload) error {
-	config, err := clients.GetInClusterConfig()
+// patchDataDownloadCancel patches the named DataDownload's Spec.Cancel field
+// in the cluster. A scoped merge patch (rather than a full Update of a
+// locally-fetched object) is used deliberately: the kubevirt datamover
+// controller concurrently reconciles this same DataDownload and updates its
+// Status via a full object Update, so replacing the whole object from a
+// possibly-stale local copy risks clobbering the controller's in-flight
+// status changes. Taking just namespace/name/cancel (rather than the whole
+// *velerov2alpha1.DataDownload) makes that impossible by construction, since
+// there is no local copy of Status to accidentally include.
+func (p *RestorePlugin) patchDataDownloadCancel(namespace, name string, cancel bool) error {
+	resourceClient, err := p.dataDownloadResourceClient()
 	if err != nil {
-		return fmt.Errorf("failed to get in-cluster config: %w", err)
-	}
-
-	dynamicClient, err := getDynamicClient(config)
-	if err != nil {
-		return fmt.Errorf("failed to get dynamic client: %w", err)
+		return err
 	}
 
 	patch, err := json.Marshal(map[string]interface{}{
 		"spec": map[string]interface{}{
-			"cancel": dd.Spec.Cancel,
+			"cancel": cancel,
 		},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to build DataDownload cancel patch: %w", err)
-	}
-
-	gvr := schema.GroupVersionResource{
-		Group:    "velero.io",
-		Version:  "v2alpha1",
-		Resource: "datadownloads",
 	}
 
 	parentCtx, cancelParent := context.WithTimeout(context.Background(), cancelPatchTotalTimeout)
@@ -732,9 +798,9 @@ func (p *RestorePlugin) updateDataDownload(dd *velerov2alpha1.DataDownload) erro
 	}, func() error {
 		ctx, cancel := context.WithTimeout(parentCtx, apiCallTimeout)
 		defer cancel()
-		_, patchErr := dynamicClient.Resource(gvr).Namespace(dd.Namespace).Patch(
+		_, patchErr := resourceClient.Namespace(namespace).Patch(
 			ctx,
-			dd.Name,
+			name,
 			types.MergePatchType,
 			patch,
 			metav1.PatchOptions{},
@@ -862,12 +928,8 @@ func generateDataDownloadName(restoreName, namespace, pvcName string) string {
 
 // getDynamicClient returns a dynamic client for working with unstructured resources.
 // This variable can be overridden for testing.
-var getDynamicClient = func(config interface{}) (dynamicClientInterface, error) {
-	restConfig, ok := config.(*rest.Config)
-	if !ok {
-		return nil, fmt.Errorf("invalid config type: expected *rest.Config")
-	}
-	return dynamic.NewForConfig(restConfig)
+var getDynamicClient = func(config *rest.Config) (dynamicClientInterface, error) {
+	return dynamic.NewForConfig(config)
 }
 
 // dynamicClientInterface defines the interface for dynamic client operations.
@@ -877,6 +939,6 @@ type dynamicClientInterface interface {
 }
 
 // SetDynamicClientFunc allows overriding the dynamic client creation for testing.
-func SetDynamicClientFunc(fn func(config interface{}) (dynamicClientInterface, error)) {
+func SetDynamicClientFunc(fn func(config *rest.Config) (dynamicClientInterface, error)) {
 	getDynamicClient = fn
 }
