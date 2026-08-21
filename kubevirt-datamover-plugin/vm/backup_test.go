@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/wait"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -514,6 +515,225 @@ func TestBackupPlugin_checkPreconditions(t *testing.T) {
 	}
 }
 
+// stubVolumeHelper is a minimal vhutil.VolumeHelper implementation used to
+// test checkVolumePolicies and getFirstKubevirtPVC in isolation, without
+// needing a real resource-policy ConfigMap wired through
+// volumehelper.NewVolumeHelperWithCache. Responses are keyed by the PVC name
+// read off the unstructured object each method is called with.
+type stubVolumeHelper struct {
+	shouldSnapshot    map[string]bool
+	shouldSnapshotErr map[string]error
+	shouldCustom      map[string]bool
+	shouldCustomErr   map[string]error
+}
+
+func (s *stubVolumeHelper) ShouldPerformSnapshot(obj runtime.Unstructured, _ schema.GroupResource) (bool, error) {
+	name := obj.(*unstructured.Unstructured).GetName()
+	if err, ok := s.shouldSnapshotErr[name]; ok {
+		return false, err
+	}
+	return s.shouldSnapshot[name], nil
+}
+
+func (s *stubVolumeHelper) ShouldPerformCustomAction(obj runtime.Unstructured, _ schema.GroupResource, _ map[string]any) (bool, error) {
+	name := obj.(*unstructured.Unstructured).GetName()
+	if err, ok := s.shouldCustomErr[name]; ok {
+		return false, err
+	}
+	return s.shouldCustom[name], nil
+}
+
+func (s *stubVolumeHelper) ShouldPerformFSBackup(corev1.Volume, corev1.Pod) (bool, error) {
+	return false, nil
+}
+
+func (s *stubVolumeHelper) GetActionParameters(runtime.Unstructured, schema.GroupResource) (bool, string, map[string]any, error) {
+	return false, "", nil, nil
+}
+
+// vmWithPVCVolumes returns a running test VM whose template has one PVC
+// volume per name in pvcNames (volume name == PVC name for simplicity).
+func vmWithPVCVolumes(namespace, name string, pvcNames ...string) *kvcore.VirtualMachine {
+	vm := createTestVM(namespace, name, kvcore.VirtualMachineStatusRunning)
+	for _, pvcName := range pvcNames {
+		vm.Spec.Template.Spec.Volumes = append(vm.Spec.Template.Spec.Volumes, kvcore.Volume{
+			Name: pvcName,
+			VolumeSource: kvcore.VolumeSource{
+				PersistentVolumeClaim: &kvcore.PersistentVolumeClaimVolumeSource{
+					PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvcName,
+					},
+				},
+			},
+		})
+	}
+	return vm
+}
+
+// withFakeCoreClient installs fakeCore as the package-level core client for
+// the duration of t, restoring it (to nil) via t.Cleanup.
+func withFakeCoreClient(t *testing.T, fakeCore *k8sfake.Clientset) {
+	t.Helper()
+	clients.SetCoreClient(fakeCore.CoreV1())
+	t.Cleanup(func() { clients.SetCoreClient(nil) })
+}
+
+func TestCheckVolumePolicies(t *testing.T) {
+	backup := &velerov1.Backup{ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"}}
+
+	t.Run("no PVCs", func(t *testing.T) {
+		vm := createTestVM(testNamespace, testVMName, kvcore.VirtualMachineStatusRunning)
+
+		hasKubevirt, hasConflict, err := checkVolumePolicies(vm, backup, newTestLogger(), &stubVolumeHelper{})
+
+		require.NoError(t, err)
+		assert.False(t, hasKubevirt)
+		assert.False(t, hasConflict)
+	})
+
+	t.Run("PVC not found is skipped", func(t *testing.T) {
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "missing-pvc")
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset())
+
+		hasKubevirt, hasConflict, err := checkVolumePolicies(vm, backup, newTestLogger(), &stubVolumeHelper{})
+
+		require.NoError(t, err)
+		assert.False(t, hasKubevirt)
+		assert.False(t, hasConflict)
+	})
+
+	t.Run("core client Get error propagates", func(t *testing.T) {
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		fakeCore := k8sfake.NewSimpleClientset()
+		fakeCore.PrependReactor("get", "persistentvolumeclaims", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, fmt.Errorf("simulated get failure")
+		})
+		withFakeCoreClient(t, fakeCore)
+
+		_, _, err := checkVolumePolicies(vm, backup, newTestLogger(), &stubVolumeHelper{})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "simulated get failure")
+	})
+
+	t.Run("snapshot policy sets hasConflictingPolicy", func(t *testing.T) {
+		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Namespace: testNamespace}}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset(pvc))
+
+		vh := &stubVolumeHelper{shouldSnapshot: map[string]bool{"pvc-1": true}}
+		hasKubevirt, hasConflict, err := checkVolumePolicies(vm, backup, newTestLogger(), vh)
+
+		require.NoError(t, err)
+		assert.False(t, hasKubevirt)
+		assert.True(t, hasConflict)
+	})
+
+	t.Run("custom kubevirt policy sets hasKubevirtPolicy", func(t *testing.T) {
+		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Namespace: testNamespace}}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset(pvc))
+
+		vh := &stubVolumeHelper{shouldCustom: map[string]bool{"pvc-1": true}}
+		hasKubevirt, hasConflict, err := checkVolumePolicies(vm, backup, newTestLogger(), vh)
+
+		require.NoError(t, err)
+		assert.True(t, hasKubevirt)
+		assert.False(t, hasConflict)
+	})
+
+	t.Run("ShouldPerformSnapshot error propagates", func(t *testing.T) {
+		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Namespace: testNamespace}}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset(pvc))
+
+		vh := &stubVolumeHelper{shouldSnapshotErr: map[string]error{"pvc-1": fmt.Errorf("policy check boom")}}
+		_, _, err := checkVolumePolicies(vm, backup, newTestLogger(), vh)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "policy check boom")
+	})
+
+	t.Run("ShouldPerformCustomAction error propagates", func(t *testing.T) {
+		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Namespace: testNamespace}}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset(pvc))
+
+		vh := &stubVolumeHelper{shouldCustomErr: map[string]error{"pvc-1": fmt.Errorf("custom check boom")}}
+		_, _, err := checkVolumePolicies(vm, backup, newTestLogger(), vh)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "custom check boom")
+	})
+}
+
+func TestBackupPlugin_getFirstKubevirtPVC(t *testing.T) {
+	backup := &velerov1.Backup{ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"}}
+
+	t.Run("no PVCs", func(t *testing.T) {
+		plugin := &BackupPlugin{Log: newTestLogger()}
+		vm := createTestVM(testNamespace, testVMName, kvcore.VirtualMachineStatusRunning)
+
+		_, err := plugin.getFirstKubevirtPVC(vm, backup, &stubVolumeHelper{})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no PVCs found")
+	})
+
+	t.Run("skips not-found PVC and returns first match", func(t *testing.T) {
+		plugin := &BackupPlugin{Log: newTestLogger()}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "missing-pvc", "pvc-2")
+		pvc2 := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-2", Namespace: testNamespace}}
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset(pvc2))
+
+		vh := &stubVolumeHelper{shouldCustom: map[string]bool{"pvc-2": true}}
+		result, err := plugin.getFirstKubevirtPVC(vm, backup, vh)
+
+		require.NoError(t, err)
+		assert.Equal(t, "pvc-2", result.Name)
+	})
+
+	t.Run("get error propagates", func(t *testing.T) {
+		plugin := &BackupPlugin{Log: newTestLogger()}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		fakeCore := k8sfake.NewSimpleClientset()
+		fakeCore.PrependReactor("get", "persistentvolumeclaims", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, fmt.Errorf("simulated get failure")
+		})
+		withFakeCoreClient(t, fakeCore)
+
+		_, err := plugin.getFirstKubevirtPVC(vm, backup, &stubVolumeHelper{})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "simulated get failure")
+	})
+
+	t.Run("ShouldPerformCustomAction error propagates", func(t *testing.T) {
+		plugin := &BackupPlugin{Log: newTestLogger()}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Namespace: testNamespace}}
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset(pvc))
+
+		vh := &stubVolumeHelper{shouldCustomErr: map[string]error{"pvc-1": fmt.Errorf("custom check boom")}}
+		_, err := plugin.getFirstKubevirtPVC(vm, backup, vh)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "custom check boom")
+	})
+
+	t.Run("no PVC eligible", func(t *testing.T) {
+		plugin := &BackupPlugin{Log: newTestLogger()}
+		vm := vmWithPVCVolumes(testNamespace, testVMName, "pvc-1")
+		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Namespace: testNamespace}}
+		withFakeCoreClient(t, k8sfake.NewSimpleClientset(pvc))
+
+		_, err := plugin.getFirstKubevirtPVC(vm, backup, &stubVolumeHelper{})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no PVC eligible")
+	})
+}
+
 func getFakeClient() crclient.Client {
 	scheme := runtime.NewScheme()
 	//_ = velerov2alpha1.AddToScheme(scheme)
@@ -539,7 +759,7 @@ func newDataUploadDynamicClient(t *testing.T, objects ...runtime.Object) *dynami
 func withFakeDynamicClient(t *testing.T, fakeDynamic *dynamicfake.FakeDynamicClient) {
 	t.Helper()
 	original := getDynamicClient
-	SetDynamicClientFunc(func(config interface{}) (dynamicClientInterface, error) {
+	SetDynamicClientFunc(func(config *rest.Config) (dynamicClientInterface, error) {
 		return fakeDynamic, nil
 	})
 	t.Cleanup(func() { SetDynamicClientFunc(original) })
@@ -557,6 +777,18 @@ func withFastCancelBackoff(t *testing.T) {
 	original := cancelPatchBackoff
 	cancelPatchBackoff = wait.Backoff{Steps: 3, Duration: time.Millisecond, Factor: 1.0}
 	t.Cleanup(func() { cancelPatchBackoff = original })
+}
+
+// withFastCreateRetryBackoff overrides the package-level
+// createRetryBackoffUnit with a near-zero duration for the duration of t,
+// restoring the original via t.Cleanup. Used by createDataUpload retry
+// tests so they don't pay the real (attempt * 100ms) sleep between
+// double-race retry attempts.
+func withFastCreateRetryBackoff(t *testing.T) {
+	t.Helper()
+	original := createRetryBackoffUnit
+	createRetryBackoffUnit = time.Microsecond
+	t.Cleanup(func() { createRetryBackoffUnit = original })
 }
 
 func dataUploadUnstructured(t *testing.T, du *velerov2alpha1.DataUpload) *unstructured.Unstructured {
@@ -604,6 +836,115 @@ func TestBackupPlugin_CreateDataUpload_Create(t *testing.T) {
 	assert.Equal(t, result, createdDU, "createDataUpload must return the object it actually created")
 }
 
+func TestBackupPlugin_CreateDataUpload_CapsExcessiveOperationTimeout(t *testing.T) {
+	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero", UID: "backup-uid"},
+		Spec: velerov1.BackupSpec{
+			StorageLocation:      "my-bsl",
+			ItemOperationTimeout: metav1.Duration{Duration: 100 * time.Hour},
+		},
+	}
+	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
+
+	fakeDynamic := newDataUploadDynamicClient(t)
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	result, err := plugin.createDataUpload(vm, backup, "op-cap-1", sourcePVC)
+
+	require.NoError(t, err)
+	assert.Equal(t, maxOperationTimeout, result.Spec.OperationTimeout.Duration,
+		"an excessive ItemOperationTimeout must be capped rather than passed through uncapped")
+
+	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
+	created, err := fakeDynamic.Resource(gvr).Namespace(backup.Namespace).Get(context.Background(), result.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	createdDU := &velerov2alpha1.DataUpload{}
+	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(created.Object, createdDU))
+	assert.Equal(t, maxOperationTimeout, createdDU.Spec.OperationTimeout.Duration,
+		"the persisted DataUpload must carry the capped timeout, not just the locally returned one")
+}
+
+func TestBackupPlugin_CreateDataUpload_RetriesOnDoubleRace(t *testing.T) {
+	withFastCreateRetryBackoff(t)
+
+	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero", UID: "backup-uid"},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
+
+	fakeDynamic := newDataUploadDynamicClient(t)
+	createAttempts := 0
+	fakeDynamic.PrependReactor("create", "datauploads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAttempts++
+		if createAttempts == 1 {
+			// Simulates the double race: some other actor's Create() is what
+			// the real AlreadyExists below would report, but by the time we
+			// re-fetch it, it's already gone (e.g. deleted concurrently) --
+			// which in this fake is simply "the object was never actually
+			// added", since this reactor intercepts the real tracker.
+			gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
+			name := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
+			return true, nil, apierrors.NewAlreadyExists(gvr.GroupResource(), name)
+		}
+		// Let subsequent attempts fall through to the real tracker.
+		return false, nil, nil
+	})
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	result, err := plugin.createDataUpload(vm, backup, "op-race-1", sourcePVC)
+
+	require.NoError(t, err, "createDataUpload must retry past a double create/delete race instead of erroring out")
+	require.NotNil(t, result)
+	assert.Equal(t, 2, createAttempts, "must retry Create() exactly once after the re-fetch reports NotFound")
+
+	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
+	list, err := fakeDynamic.Resource(gvr).Namespace(backup.Namespace).List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, list.Items, 1, "the retried Create() must have persisted exactly one DataUpload")
+}
+
+func TestBackupPlugin_CreateDataUpload_ExhaustsRetriesOnPersistentDoubleRace(t *testing.T) {
+	withFastCreateRetryBackoff(t)
+
+	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero", UID: "backup-uid"},
+		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
+
+	fakeDynamic := newDataUploadDynamicClient(t)
+	createAttempts := 0
+	fakeDynamic.PrependReactor("create", "datauploads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		// Every attempt hits the double race -- Create() always reports
+		// AlreadyExists, and (since this reactor intercepts every real
+		// Create) the object is never actually persisted, so the
+		// subsequent re-fetch always reports NotFound too. This never
+		// resolves, so createDataUpload must give up after
+		// maxCreateAttempts rather than retrying forever.
+		createAttempts++
+		gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
+		name := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
+		return true, nil, apierrors.NewAlreadyExists(gvr.GroupResource(), name)
+	})
+	withFakeDynamicClient(t, fakeDynamic)
+
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	_, err := plugin.createDataUpload(vm, backup, "op-race-exhaust-1", sourcePVC)
+
+	require.Error(t, err, "createDataUpload must give up after exhausting retries on a persistent double-race")
+	assert.Contains(t, err.Error(), fmt.Sprintf("after %d attempts", maxCreateAttempts))
+	assert.Equal(t, maxCreateAttempts, createAttempts)
+}
+
 func TestBackupPlugin_CreateDataUpload_AlreadyExists_Reuse(t *testing.T) {
 	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
 	backup := &velerov1.Backup{
@@ -630,17 +971,21 @@ func TestBackupPlugin_CreateDataUpload_AlreadyExists_Reuse(t *testing.T) {
 				controllercommon.AnnotationVMName:      vm.Name,
 				controllercommon.AnnotationVMNamespace: vm.Namespace,
 				controllercommon.AnnotationOperationID: operationID,
+				// Distinguishes the fetched-from-cluster object from the locally
+				// built one (which never sets this annotation, since vm has no
+				// AnnotationBackupPVCSize of its own), so this test actually
+				// proves the adoption path returns what's in the cluster rather
+				// than trivially matching locally-derived name/operationID values
+				// that would match either way.
+				controllercommon.AnnotationBackupPVCSize: "42Gi",
 			},
 			OwnerReferences: []metav1.OwnerReference{{UID: backup.UID}},
 		},
 		Spec: velerov2alpha1.DataUploadSpec{
-			SourcePVC:       sourcePVC.Name,
-			SourceNamespace: vm.Namespace,
-			// Distinguishes the fetched-from-cluster object from the locally
-			// built one, so this test actually proves the adoption path
-			// returns what's in the cluster rather than trivially matching
-			// locally-derived name/operationID values that would match either way.
-			BackupStorageLocation: "seeded-bsl",
+			DataMover:             controllercommon.DataMoverKubeVirt,
+			SourcePVC:             sourcePVC.Name,
+			SourceNamespace:       vm.Namespace,
+			BackupStorageLocation: backup.Spec.StorageLocation,
 		},
 	}
 
@@ -654,7 +999,7 @@ func TestBackupPlugin_CreateDataUpload_AlreadyExists_Reuse(t *testing.T) {
 	require.NoError(t, err, "createDataUpload must reuse the existing DataUpload instead of erroring on AlreadyExists")
 	assert.Equal(t, existingName, result.Name)
 	assert.Equal(t, operationID, result.Annotations[controllercommon.AnnotationOperationID])
-	assert.Equal(t, "seeded-bsl", result.Spec.BackupStorageLocation,
+	assert.Equal(t, "42Gi", result.Annotations[controllercommon.AnnotationBackupPVCSize],
 		"createDataUpload must return the object fetched from the cluster, not the locally built one")
 
 	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
@@ -663,189 +1008,156 @@ func TestBackupPlugin_CreateDataUpload_AlreadyExists_Reuse(t *testing.T) {
 	assert.Len(t, list.Items, 1, "createDataUpload must not create a duplicate DataUpload for a retried call")
 }
 
-func TestBackupPlugin_CreateDataUpload_AlreadyExists_Mismatch(t *testing.T) {
-	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
-	backup := &velerov1.Backup{
-		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"},
-		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
-	}
-	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
-
-	operationID := generateOperationID(backup.Name, vm.Namespace, vm.Name)
-	existingName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
-
-	// Same deterministic name, but a different SourcePVC -- must not be mistaken
-	// for "our" operation and silently reused.
-	existing := &velerov2alpha1.DataUpload{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      existingName,
-			Namespace: backup.Namespace,
-		},
-		Spec: velerov2alpha1.DataUploadSpec{
-			SourcePVC:       "some-other-pvc",
-			SourceNamespace: vm.Namespace,
-		},
-	}
-
-	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, existing))
-	withFakeDynamicClient(t, fakeDynamic)
-
-	plugin := &BackupPlugin{Log: newTestLogger()}
-
-	_, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "some-other-pvc", "must reject on the source PVC mismatch branch")
-	assert.Contains(t, err.Error(), "refusing to reuse")
-}
-
-func TestBackupPlugin_CreateDataUpload_AlreadyExists_NamespaceMismatch(t *testing.T) {
-	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
-	backup := &velerov1.Backup{
-		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"},
-		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
-	}
-	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
-
-	operationID := generateOperationID(backup.Name, vm.Namespace, vm.Name)
-	existingName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
-
-	// Same deterministic name and the same SourcePVC name, but a different
-	// SourceNamespace -- e.g. a same-named VM backed up from a different
-	// namespace. Must not be mistaken for "our" operation and silently reused.
-	existing := &velerov2alpha1.DataUpload{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      existingName,
-			Namespace: backup.Namespace,
-		},
-		Spec: velerov2alpha1.DataUploadSpec{
-			SourcePVC:       sourcePVC.Name,
-			SourceNamespace: "some-other-namespace",
-		},
-	}
-
-	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, existing))
-	withFakeDynamicClient(t, fakeDynamic)
-
-	plugin := &BackupPlugin{Log: newTestLogger()}
-
-	_, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "some-other-namespace", "must reject on the source namespace mismatch branch")
-	assert.Contains(t, err.Error(), "refusing to reuse")
-}
-
-func TestBackupPlugin_CreateDataUpload_AlreadyExists_OwnerUIDMismatch(t *testing.T) {
-	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
-	backup := &velerov1.Backup{
-		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero", UID: "current-backup-uid"},
-		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
-	}
-	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
-
-	operationID := generateOperationID(backup.Name, vm.Namespace, vm.Name)
-	existingName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
-
-	// Source matches, but the object's owner reference belongs to a prior
-	// Backup of the same name that was deleted and recreated.
-	existing := &velerov2alpha1.DataUpload{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            existingName,
-			Namespace:       backup.Namespace,
-			OwnerReferences: []metav1.OwnerReference{{UID: "stale-backup-uid"}},
-		},
-		Spec: velerov2alpha1.DataUploadSpec{
-			SourcePVC:       sourcePVC.Name,
-			SourceNamespace: vm.Namespace,
-		},
-	}
-
-	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, existing))
-	withFakeDynamicClient(t, fakeDynamic)
-
-	plugin := &BackupPlugin{Log: newTestLogger()}
-
-	_, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "is not owned by Backup")
-}
-
-func TestBackupPlugin_CreateDataUpload_AlreadyExists_NoOperationIDAnnotation(t *testing.T) {
+// TestBackupPlugin_CreateDataUpload_AlreadyExists_RejectionBranches covers
+// every branch of createDataUpload's AlreadyExists-adoption checks that must
+// reject reuse of an existing DataUpload. Each case starts from a shared
+// baseline object that createDataUpload WOULD accept and mutates exactly the
+// one field that should trip a single rejection branch, so a passing case
+// proves that branch -- and only that branch -- is what produced the error.
+func TestBackupPlugin_CreateDataUpload_AlreadyExists_RejectionBranches(t *testing.T) {
 	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
 	backup := &velerov1.Backup{
 		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero", UID: "backup-uid"},
 		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
 	}
 	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
-
 	operationID := generateOperationID(backup.Name, vm.Namespace, vm.Name)
 	existingName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
+	const existingOperationID = "existing-operation-id"
 
-	// Source and owner match, but Progress and Cancel could never find this
-	// object without the operation-ID annotation.
-	existing := &velerov2alpha1.DataUpload{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            existingName,
-			Namespace:       backup.Namespace,
-			OwnerReferences: []metav1.OwnerReference{{UID: backup.UID}},
-		},
-		Spec: velerov2alpha1.DataUploadSpec{
-			SourcePVC:       sourcePVC.Name,
-			SourceNamespace: vm.Namespace,
-		},
-	}
-
-	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, existing))
-	withFakeDynamicClient(t, fakeDynamic)
-
-	plugin := &BackupPlugin{Log: newTestLogger()}
-
-	_, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), controllercommon.AnnotationOperationID)
-}
-
-func TestBackupPlugin_CreateDataUpload_AlreadyExists_BackupNameLabelMismatch(t *testing.T) {
-	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
-	backup := &velerov1.Backup{
-		ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero", UID: "backup-uid"},
-		Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
-	}
-	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
-
-	operationID := generateOperationID(backup.Name, vm.Namespace, vm.Name)
-	existingName := generateDataUploadName(backup.Name, vm.Namespace, vm.Name)
-
-	// Source, owner, and operationID annotation all match, but the
-	// BackupNameLabel is missing -- getDataUploadByOperationID selects on it
-	// server-side, so this object would be unreachable for Progress/Cancel.
-	existing := &velerov2alpha1.DataUpload{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            existingName,
-			Namespace:       backup.Namespace,
-			OwnerReferences: []metav1.OwnerReference{{UID: backup.UID}},
-			Annotations: map[string]string{
-				controllercommon.AnnotationOperationID: operationID,
+	baseline := func() *velerov2alpha1.DataUpload {
+		return &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      existingName,
+				Namespace: backup.Namespace,
+				Labels: map[string]string{
+					velerov1.BackupNameLabel: controllercommon.SafeLabelValue(backup.Name),
+				},
+				Annotations: map[string]string{
+					controllercommon.AnnotationVMName:      vm.Name,
+					controllercommon.AnnotationVMNamespace: vm.Namespace,
+					controllercommon.AnnotationOperationID: existingOperationID,
+				},
+				OwnerReferences: []metav1.OwnerReference{{UID: backup.UID}},
 			},
+			Spec: velerov2alpha1.DataUploadSpec{
+				DataMover:             controllercommon.DataMoverKubeVirt,
+				BackupStorageLocation: backup.Spec.StorageLocation,
+				SourcePVC:             sourcePVC.Name,
+				SourceNamespace:       vm.Namespace,
+			},
+		}
+	}
+
+	testCases := []struct {
+		name          string
+		mutate        func(du *velerov2alpha1.DataUpload)
+		injectGetErr  string
+		wantErrSubstr []string
+	}{
+		{
+			// Control case: proves baseline() itself is a valid adoption
+			// target, so every other case's rejection is actually caused by
+			// its one mutated field rather than baseline() already being
+			// invalid for some unrelated reason.
+			name:   "unmutated baseline is reused without error",
+			mutate: func(du *velerov2alpha1.DataUpload) {},
 		},
-		Spec: velerov2alpha1.DataUploadSpec{
-			SourcePVC:       sourcePVC.Name,
-			SourceNamespace: vm.Namespace,
+		{
+			name:          "source PVC mismatch",
+			mutate:        func(du *velerov2alpha1.DataUpload) { du.Spec.SourcePVC = "some-other-pvc" },
+			wantErrSubstr: []string{"refusing to reuse", "some-other-pvc"},
+		},
+		{
+			name:          "source namespace mismatch",
+			mutate:        func(du *velerov2alpha1.DataUpload) { du.Spec.SourceNamespace = "some-other-namespace" },
+			wantErrSubstr: []string{"refusing to reuse", "some-other-namespace"},
+		},
+		{
+			name: "owner UID mismatch",
+			mutate: func(du *velerov2alpha1.DataUpload) {
+				du.OwnerReferences = []metav1.OwnerReference{{UID: "stale-backup-uid"}}
+			},
+			wantErrSubstr: []string{"is not owned by Backup"},
+		},
+		{
+			name: "VM identity mismatch",
+			mutate: func(du *velerov2alpha1.DataUpload) {
+				du.Annotations[controllercommon.AnnotationVMName] = "some-other-vm"
+			},
+			wantErrSubstr: []string{"some-other-vm", "refusing to reuse"},
+		},
+		{
+			name: "VM namespace annotation mismatch",
+			mutate: func(du *velerov2alpha1.DataUpload) {
+				du.Annotations[controllercommon.AnnotationVMNamespace] = "some-other-vm-ns"
+			},
+			wantErrSubstr: []string{"some-other-vm-ns", "refusing to reuse"},
+		},
+		{
+			name:          "data mover mismatch",
+			mutate:        func(du *velerov2alpha1.DataUpload) { du.Spec.DataMover = "some-other-datamover" },
+			wantErrSubstr: []string{"some-other-datamover"},
+		},
+		{
+			name:          "backup storage location mismatch",
+			mutate:        func(du *velerov2alpha1.DataUpload) { du.Spec.BackupStorageLocation = "some-other-bsl" },
+			wantErrSubstr: []string{"some-other-bsl"},
+		},
+		{
+			name:          "missing operationID annotation",
+			mutate:        func(du *velerov2alpha1.DataUpload) { delete(du.Annotations, controllercommon.AnnotationOperationID) },
+			wantErrSubstr: []string{"refusing to reuse", controllercommon.AnnotationOperationID},
+		},
+		{
+			name:          "backup name label mismatch",
+			mutate:        func(du *velerov2alpha1.DataUpload) { delete(du.Labels, velerov1.BackupNameLabel) },
+			wantErrSubstr: []string{velerov1.BackupNameLabel},
+		},
+		{
+			name: "divergent backup name label value",
+			mutate: func(du *velerov2alpha1.DataUpload) {
+				du.Labels[velerov1.BackupNameLabel] = "some-other-backup"
+			},
+			wantErrSubstr: []string{velerov1.BackupNameLabel, "some-other-backup"},
+		},
+		{
+			name:          "re-fetch error",
+			mutate:        func(du *velerov2alpha1.DataUpload) {},
+			injectGetErr:  "simulated get failure",
+			wantErrSubstr: []string{"could not be re-fetched"},
 		},
 	}
 
-	fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, existing))
-	withFakeDynamicClient(t, fakeDynamic)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			existing := baseline()
+			tc.mutate(existing)
 
-	plugin := &BackupPlugin{Log: newTestLogger()}
+			fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, existing))
+			if tc.injectGetErr != "" {
+				fakeDynamic.PrependReactor("get", "datauploads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, fmt.Errorf("%s", tc.injectGetErr)
+				})
+			}
+			withFakeDynamicClient(t, fakeDynamic)
 
-	_, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
+			plugin := &BackupPlugin{Log: newTestLogger()}
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), velerov1.BackupNameLabel)
+			result, err := plugin.createDataUpload(vm, backup, operationID, sourcePVC)
+
+			if len(tc.wantErrSubstr) == 0 {
+				require.NoError(t, err, "an unmutated baseline object must be a valid adoption target")
+				assert.Equal(t, existingOperationID, result.Annotations[controllercommon.AnnotationOperationID],
+					"createDataUpload must return the adopted object's stored operationID so Progress and Cancel can find it")
+				return
+			}
+			require.Error(t, err)
+			for _, substr := range tc.wantErrSubstr {
+				assert.Contains(t, err.Error(), substr)
+			}
+		})
+	}
 }
 
 func TestBackupPlugin_Cancel(t *testing.T) {
@@ -1046,6 +1358,157 @@ func TestBackupPlugin_Cancel_NotFound(t *testing.T) {
 
 	err := plugin.Cancel("missing-op", backup)
 	assert.NoError(t, err)
+}
+
+func TestBackupPlugin_getDataUploadByOperationID(t *testing.T) {
+	backup := &velerov1.Backup{ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero"}}
+
+	t.Run("finds the matching DataUpload among several sharing the backup label", func(t *testing.T) {
+		const wantOperationID = "op-match"
+		match := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "du-match",
+				Namespace: backup.Namespace,
+				Labels:    map[string]string{velerov1.BackupNameLabel: controllercommon.SafeLabelValue(backup.Name)},
+				Annotations: map[string]string{
+					controllercommon.AnnotationOperationID: wantOperationID,
+				},
+			},
+		}
+		decoy := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "du-decoy",
+				Namespace: backup.Namespace,
+				Labels:    map[string]string{velerov1.BackupNameLabel: controllercommon.SafeLabelValue(backup.Name)},
+				Annotations: map[string]string{
+					controllercommon.AnnotationOperationID: "op-other",
+				},
+			},
+		}
+
+		fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, match), dataUploadUnstructured(t, decoy))
+		withFakeDynamicClient(t, fakeDynamic)
+
+		plugin := &BackupPlugin{Log: newTestLogger()}
+
+		result, err := plugin.getDataUploadByOperationID(wantOperationID, backup)
+
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Equal(t, "du-match", result.Name)
+	})
+
+	t.Run("returns nil, nil when no DataUpload matches", func(t *testing.T) {
+		fakeDynamic := newDataUploadDynamicClient(t)
+		withFakeDynamicClient(t, fakeDynamic)
+
+		plugin := &BackupPlugin{Log: newTestLogger()}
+
+		result, err := plugin.getDataUploadByOperationID("no-such-op", backup)
+
+		require.NoError(t, err)
+		assert.Nil(t, result)
+	})
+
+	t.Run("propagates a List error", func(t *testing.T) {
+		fakeDynamic := newDataUploadDynamicClient(t)
+		fakeDynamic.PrependReactor("list", "datauploads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, fmt.Errorf("simulated list failure")
+		})
+		withFakeDynamicClient(t, fakeDynamic)
+
+		plugin := &BackupPlugin{Log: newTestLogger()}
+
+		_, err := plugin.getDataUploadByOperationID("op-1", backup)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "simulated list failure")
+	})
+}
+
+func TestBackupPlugin_patchDataUploadCancel(t *testing.T) {
+	t.Run("patches only spec.cancel, leaving status and other spec fields untouched", func(t *testing.T) {
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: "du-patch", Namespace: "velero"},
+			Spec:       velerov2alpha1.DataUploadSpec{Cancel: false, BackupStorageLocation: "my-bsl"},
+			Status: velerov2alpha1.DataUploadStatus{
+				Phase:   velerov2alpha1.DataUploadPhaseInProgress,
+				Message: "controller-owned status",
+			},
+		}
+		fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, du))
+		withFakeDynamicClient(t, fakeDynamic)
+
+		plugin := &BackupPlugin{Log: newTestLogger()}
+
+		err := plugin.patchDataUploadCancel(du.Namespace, du.Name, true)
+		require.NoError(t, err)
+
+		gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
+		updated, err := fakeDynamic.Resource(gvr).Namespace(du.Namespace).Get(context.Background(), du.Name, metav1.GetOptions{})
+		require.NoError(t, err)
+		updatedDU := &velerov2alpha1.DataUpload{}
+		require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(updated.Object, updatedDU))
+
+		assert.True(t, updatedDU.Spec.Cancel)
+		assert.Equal(t, "my-bsl", updatedDU.Spec.BackupStorageLocation)
+		assert.Equal(t, velerov2alpha1.DataUploadPhaseInProgress, updatedDU.Status.Phase)
+		assert.Equal(t, "controller-owned status", updatedDU.Status.Message)
+	})
+
+	t.Run("does not retry a NotFound patch", func(t *testing.T) {
+		withFastCancelBackoff(t)
+
+		fakeDynamic := newDataUploadDynamicClient(t)
+		attempts := 0
+		fakeDynamic.PrependReactor("patch", "datauploads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			attempts++
+			return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: "velero.io", Resource: "datauploads"}, "missing-du")
+		})
+		withFakeDynamicClient(t, fakeDynamic)
+
+		plugin := &BackupPlugin{Log: newTestLogger()}
+
+		err := plugin.patchDataUploadCancel("velero", "missing-du", true)
+
+		require.Error(t, err)
+		assert.Equal(t, 1, attempts, "a NotFound patch error is not transient and must not be retried")
+	})
+
+	t.Run("retries a transient patch failure", func(t *testing.T) {
+		withFastCancelBackoff(t)
+
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: "du-patch-retry", Namespace: "velero"},
+			Spec:       velerov2alpha1.DataUploadSpec{Cancel: false},
+		}
+		fakeDynamic := newDataUploadDynamicClient(t, dataUploadUnstructured(t, du))
+		attempts := 0
+		fakeDynamic.PrependReactor("patch", "datauploads", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			attempts++
+			if attempts < 2 {
+				return true, nil, fmt.Errorf("simulated transient patch failure")
+			}
+			// Unhandled: let the request fall through to the tracker's default
+			// reactor, which actually applies the patch.
+			return false, nil, nil
+		})
+		withFakeDynamicClient(t, fakeDynamic)
+
+		plugin := &BackupPlugin{Log: newTestLogger()}
+
+		err := plugin.patchDataUploadCancel(du.Namespace, du.Name, true)
+
+		require.NoError(t, err, "a transient patch error must be retried via cancelPatchBackoff")
+		assert.Equal(t, 2, attempts)
+
+		gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
+		updated, err := fakeDynamic.Resource(gvr).Namespace(du.Namespace).Get(context.Background(), du.Name, metav1.GetOptions{})
+		require.NoError(t, err)
+		updatedDU := &velerov2alpha1.DataUpload{}
+		require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(updated.Object, updatedDU))
+		assert.True(t, updatedDU.Spec.Cancel)
+	})
 }
 
 func TestGenerateOperationID(t *testing.T) {
