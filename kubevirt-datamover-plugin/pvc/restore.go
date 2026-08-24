@@ -179,14 +179,12 @@ func (p *RestorePlugin) Execute(input *velero.RestoreItemActionExecuteInput) (*v
 	// here can't leave an already-created DataDownload behind with no
 	// OperationID for Velero to ever track or retry. operationID generation
 	// is itself pure/local (no cluster call), so computing it here -- ahead
-	// of clearPVCBinding, which needs it to derive restorePVLabelValue --
-	// doesn't disturb that invariant.
+	// of clearPVCBinding, which needs it to derive the dynamic-pv-restore
+	// label's value -- doesn't disturb that invariant.
 	operationID := generateOperationID(restore.Name, originalNamespace, pvc.Name)
 	p.Log.Infof("[pvc-restore] Generated operation ID: %s", operationID)
 
-	restorePVLabelValue := controllercommon.SafeLabelValue(operationID)
-
-	updatedItem, err := clearPVCBinding(input.Item, restorePVLabelValue)
+	updatedItem, err := clearPVCBinding(input.Item, controllercommon.SafeLabelValue(operationID))
 	if err != nil {
 		return nil, err
 	}
@@ -200,7 +198,7 @@ func (p *RestorePlugin) Execute(input *velero.RestoreItemActionExecuteInput) (*v
 			restore.Namespace, restore.Spec.BackupName, pvc.Namespace, pvc.Name)
 	}
 
-	dataDownload, err := p.createDataDownload(restore, backup, pvc, vmName, originalNamespace, targetNamespace, operationID, restorePVLabelValue)
+	dataDownload, err := p.createDataDownload(restore, backup, pvc, vmName, originalNamespace, targetNamespace, operationID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create DataDownload: %w", err)
 	}
@@ -255,16 +253,22 @@ func (p *RestorePlugin) Execute(input *velero.RestoreItemActionExecuteInput) (*v
 // from on its own. Clearing them here restores what Velero's own gate would
 // have done had this plugin not intercepted volumeName first.
 //
-// It also sets spec.selector with a unique per-restore label (see
-// restorePVLabelKey), mirroring Velero's own vendored CSI restore action
-// (vendor/github.com/vmware-tanzu/velero/pkg/restore/actions/csi/pvc_action.go,
+// It also sets spec.selector with a unique per-restore label under
+// velerov1.DynamicPVRestoreLabel ("velero.io/dynamic-pv-restore") --
+// Velero's own stable, already-exported constant for exactly this purpose
+// (used by Velero's built-in vendored CSI restore action,
+// vendor/github.com/vmware-tanzu/velero/pkg/restore/actions/csi/pvc_action.go,
 // restoreFromDataUploadResult). Setting spec.selector makes Kubernetes skip
 // dynamic provisioning entirely -- the PVC just sits Pending, regardless of
 // the target StorageClass's volumeBindingMode -- until something later
-// patches a matching label onto the real PV. Without this, a StorageClass
+// reconciles a matching label onto the real PV. Without this, a StorageClass
 // with volumeBindingMode: Immediate lets the CSI provisioner bind this PVC
 // to a brand-new PV before the datamover controller ever gets a chance to
-// rebind its own reconstructed-disk PV onto it.
+// rebind its own reconstructed-disk PV onto it. The kubevirt-datamover-
+// controller's handleAccepted/validateExistingPVCForBind (see
+// migtools/kubevirt-datamover-controller#199) accept a matchLabels-only
+// selector and reconcile the rebound PV's labels to satisfy it, so no
+// separate coordination channel for the label's value is needed here.
 //
 // This operates on the raw unstructured content (via RemoveNestedField)
 // rather than round-tripping through a typed corev1.PersistentVolumeClaim:
@@ -273,7 +277,7 @@ func (p *RestorePlugin) Execute(input *velero.RestoreItemActionExecuteInput) (*v
 // later Kubernetes version than this plugin was built against), whereas
 // removing/setting just the fields that actually need it preserves
 // everything else exactly as Velero handed it to us.
-func clearPVCBinding(item runtime.Unstructured, restorePVLabelValue string) (runtime.Unstructured, error) {
+func clearPVCBinding(item runtime.Unstructured, dynamicPVRestoreLabelValue string) (runtime.Unstructured, error) {
 	copied := item.DeepCopyObject()
 	cleaned, ok := copied.(runtime.Unstructured)
 	if !ok {
@@ -293,7 +297,7 @@ func clearPVCBinding(item runtime.Unstructured, restorePVLabelValue string) (run
 	if matchLabels == nil {
 		matchLabels = map[string]string{}
 	}
-	matchLabels[restorePVLabelKey] = restorePVLabelValue
+	matchLabels[velerov1.DynamicPVRestoreLabel] = dynamicPVRestoreLabelValue
 	if err := unstructured.SetNestedStringMap(content, matchLabels, "spec", "selector", "matchLabels"); err != nil {
 		return nil, fmt.Errorf("failed to set spec.selector.matchLabels: %w", err)
 	}
@@ -311,25 +315,6 @@ func clearPVCBinding(item runtime.Unstructured, restorePVLabelValue string) (run
 const (
 	kubeAnnBindCompleted     = "pv.kubernetes.io/bind-completed"
 	kubeAnnBoundByController = "pv.kubernetes.io/bound-by-controller"
-)
-
-// restorePVLabelKey is the label key clearPVCBinding injects into a restore
-// target PVC's spec.selector.matchLabels, mirroring Velero's own
-// DynamicPVRestoreLabel mechanism. annotationRestorePVLabelValue carries the
-// per-restore value of that label on the DataDownload this plugin creates,
-// so the datamover controller can read it back and patch the matching label
-// onto the PV it rebinds onto this PVC.
-//
-// This is a plugin/controller contract: it must eventually move to a shared
-// constant in github.com/migtools/kubevirt-datamover-controller/pkg/common
-// once the corresponding controller-side change lands (removing the
-// Spec.Selector != nil rejection in handleAccepted, wiring
-// patchPVLabels/patchPVBinding in pv_rebind.go to apply it) -- hardcoded
-// here in the meantime, same as kubeAnnBindCompleted/kubeAnnBoundByController
-// above, to avoid a cross-repo edit in this change.
-const (
-	restorePVLabelKey             = "kubevirt-datamover.io/restore-pv-label"
-	annotationRestorePVLabelValue = "kubevirt-datamover.io/restore-pv-label-value"
 )
 
 // Progress returns the progress of an async restore operation.
@@ -497,7 +482,7 @@ func (p *RestorePlugin) createDataDownload(
 	restore *velerov1.Restore,
 	backup *velerov1.Backup,
 	pvc *corev1.PersistentVolumeClaim,
-	vmName, originalNamespace, targetNamespace, operationID, restorePVLabelValue string,
+	vmName, originalNamespace, targetNamespace, operationID string,
 ) (*velerov2alpha1.DataDownload, error) {
 	dataDownloadName := generateDataDownloadName(restore.Name, originalNamespace, pvc.Name)
 
@@ -533,7 +518,6 @@ func (p *RestorePlugin) createDataDownload(
 				controllercommon.AnnotationVMName:      vmName,
 				controllercommon.AnnotationVMNamespace: originalNamespace,
 				controllercommon.AnnotationOperationID: operationID,
-				annotationRestorePVLabelValue:          restorePVLabelValue,
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
