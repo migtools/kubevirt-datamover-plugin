@@ -784,6 +784,12 @@ func TestRestorePlugin_Execute_AlreadyExists_Reuse(t *testing.T) {
 	require.NotNil(t, output)
 	assert.Equal(t, existingOperationID, output.OperationID)
 
+	matchLabels, found, err := unstructured.NestedStringMap(output.UpdatedItem.UnstructuredContent(), "spec", "selector", "matchLabels")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, controllercommon.SafeLabelValue(existingOperationID), matchLabels[restorePVLabelKey],
+		"a retried Execute() call for the same (restore, PVC) must stamp the identical restore-PV selector value, not a new one")
+
 	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datadownloads"}
 	list, err := fakeDynamic.Resource(gvr).Namespace(testVeleroNS).List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
@@ -1116,6 +1122,7 @@ func TestRestorePlugin_Execute_SameNamedPVCDifferentNamespaces(t *testing.T) {
 	// they're unrelated Kubernetes objects.
 	const sharedPVCName = "shared-pvc-name"
 	operationIDs := make([]string, 0, 2)
+	restorePVLabelValues := make([]string, 0, 2)
 	for _, ns := range []string{"ns-a", "ns-b"} {
 		pvc := newRestorePVC(ns, sharedPVCName, map[string]string{
 			controllercommon.AnnotationVMName: "my-vm",
@@ -1128,6 +1135,11 @@ func TestRestorePlugin_Execute_SameNamedPVCDifferentNamespaces(t *testing.T) {
 		})
 		require.NoError(t, err, "same-named PVCs from different source namespaces within one restore must not collide")
 		operationIDs = append(operationIDs, output.OperationID)
+
+		matchLabels, found, err := unstructured.NestedStringMap(output.UpdatedItem.UnstructuredContent(), "spec", "selector", "matchLabels")
+		require.NoError(t, err)
+		require.True(t, found, "Execute must stamp spec.selector.matchLabels on the returned item")
+		restorePVLabelValues = append(restorePVLabelValues, matchLabels[restorePVLabelKey])
 	}
 
 	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datadownloads"}
@@ -1135,6 +1147,15 @@ func TestRestorePlugin_Execute_SameNamedPVCDifferentNamespaces(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, list.Items, 2, "each source namespace's PVC must get its own DataDownload, not a collided/reused one")
 	assert.NotEqual(t, operationIDs[0], operationIDs[1], "same-named PVCs from different source namespaces must get distinct operation IDs")
+	assert.NotEqual(t, restorePVLabelValues[0], restorePVLabelValues[1],
+		"same-named PVCs from different source namespaces must get distinct restore-PV selector label values -- "+
+			"otherwise the datamover controller could match either PVC's selector to the wrong rebound PV")
+	for i, item := range list.Items {
+		dd := &velerov2alpha1.DataDownload{}
+		require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(item.Object, dd))
+		assert.Contains(t, restorePVLabelValues, dd.Annotations[annotationRestorePVLabelValue],
+			"DataDownload %d's restore-PV label annotation must match one of the values stamped onto its target PVC", i)
+	}
 }
 
 func TestRestorePlugin_Progress(t *testing.T) {
