@@ -15,6 +15,8 @@
 package pvc
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
 	"github.com/sirupsen/logrus"
@@ -47,6 +49,40 @@ func newTestLogger() logrus.FieldLogger {
 	logger := logrus.New()
 	logger.SetLevel(logrus.ErrorLevel)
 	return logrus.NewEntry(logger)
+}
+
+func newTestPlugin(t *testing.T, client crclient.Client) *BackupPlugin {
+	t.Helper()
+	c := client
+	plugin, err := NewBackupPlugin(newTestLogger(), &c)
+	require.NoError(t, err)
+	plugin.checkKubeVirtInstalled = func() (bool, error) { return true, nil }
+	return plugin
+}
+
+func testBackup() *velerov1.Backup {
+	return &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-backup",
+			Namespace: "velero",
+		},
+	}
+}
+
+type stubServerGroups struct {
+	groups []string
+	err    error
+}
+
+func (s stubServerGroups) ServerGroups() (*metav1.APIGroupList, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	list := &metav1.APIGroupList{}
+	for _, name := range s.groups {
+		list.Groups = append(list.Groups, metav1.APIGroup{Name: name})
+	}
+	return list, nil
 }
 
 func TestBackupPlugin_AppliesTo(t *testing.T) {
@@ -87,9 +123,7 @@ func TestBackupPlugin_Execute_NilBackup(t *testing.T) {
 }
 
 func TestBackupPlugin_Execute_PVCWithoutVM(t *testing.T) {
-	fakeClient := getFakeClient()
-	plugin, err := NewBackupPlugin(newTestLogger(), &fakeClient)
-	require.NoError(t, err)
+	plugin := newTestPlugin(t, getFakeClient())
 
 	// Setup fake client
 	scheme := runtime.NewScheme()
@@ -118,6 +152,141 @@ func TestBackupPlugin_Execute_PVCWithoutVM(t *testing.T) {
 	assert.Equal(t, item, result, "should return item as-is")
 	assert.Nil(t, additionalItems)
 	assert.Empty(t, operationID)
+}
+
+func TestKubevirtGroupInstalled(t *testing.T) {
+	testCases := []struct {
+		name    string
+		stub    stubServerGroups
+		want    bool
+		wantErr bool
+	}{
+		{name: "kubevirt.io present", stub: stubServerGroups{groups: []string{"apps", kvcore.GroupVersion.Group}}, want: true},
+		{name: "kubevirt.io absent", stub: stubServerGroups{groups: []string{"apps"}}, want: false},
+		{name: "no groups", stub: stubServerGroups{}, want: false},
+		{name: "discovery error", stub: stubServerGroups{err: fmt.Errorf("discovery failed")}, wantErr: true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := kubevirtGroupInstalled(tc.stub)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestBackupPlugin_Execute_KubeVirtAPIMissing(t *testing.T) {
+	plugin := newTestPlugin(t, getFakeClient())
+	plugin.checkKubeVirtInstalled = func() (bool, error) { return false, nil }
+
+	item := pvcToUnstructured(t, createTestPVC(testNamespace, testPVCName))
+	result, additionalItems, operationID, _, err := plugin.Execute(item, testBackup())
+
+	require.NoError(t, err)
+	assert.Equal(t, item, result)
+	assert.Nil(t, additionalItems)
+	assert.Empty(t, operationID)
+	assert.Empty(t, result.(*unstructured.Unstructured).GetAnnotations()[controllercommon.AnnotationVMName])
+}
+
+func TestBackupPlugin_Execute_KubeVirtDiscoveryError(t *testing.T) {
+	plugin := newTestPlugin(t, getFakeClient())
+	plugin.checkKubeVirtInstalled = func() (bool, error) { return false, fmt.Errorf("discovery failed") }
+
+	_, _, _, _, err := plugin.Execute(pvcToUnstructured(t, createTestPVC(testNamespace, testPVCName)), testBackup())
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to detect kubevirt API")
+	assert.Contains(t, err.Error(), "discovery failed")
+	assert.Equal(t, kubevirtInstallUnknown, plugin.kubevirtInstall)
+}
+
+func TestBackupPlugin_Execute_ListVMsOtherError(t *testing.T) {
+	intercept := &interceptListClient{
+		Client:  getFakeClient(),
+		listErr: fmt.Errorf("connection refused"),
+	}
+	plugin := newTestPlugin(t, intercept)
+
+	_, _, _, _, err := plugin.Execute(pvcToUnstructured(t, createTestPVC(testNamespace, testPVCName)), testBackup())
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to get PVC list")
+	assert.Contains(t, err.Error(), "failed to list VMs")
+	assert.Contains(t, err.Error(), "connection refused")
+}
+
+func TestBackupPlugin_Execute_KubeVirtAPIMissingCachedAcrossNamespaces(t *testing.T) {
+	checks := 0
+	plugin := newTestPlugin(t, getFakeClient())
+	plugin.checkKubeVirtInstalled = func() (bool, error) {
+		checks++
+		return false, nil
+	}
+
+	_, _, _, _, err := plugin.Execute(pvcToUnstructured(t, createTestPVC(testNamespace, testPVCName)), testBackup())
+	require.NoError(t, err)
+	_, _, _, _, err = plugin.Execute(pvcToUnstructured(t, createTestPVC("other-namespace", "other-pvc")), testBackup())
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, checks)
+	assert.Equal(t, kubevirtInstallMissing, plugin.kubevirtInstall)
+}
+
+func TestShouldListVMsLocked(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		plugin := &BackupPlugin{Log: newTestLogger()}
+		plugin.checkKubeVirtInstalled = func() (bool, error) { return false, nil }
+
+		list, err := plugin.shouldListVMsLocked()
+
+		require.NoError(t, err)
+		assert.False(t, list)
+		assert.Equal(t, kubevirtInstallMissing, plugin.kubevirtInstall)
+	})
+
+	t.Run("present", func(t *testing.T) {
+		plugin := &BackupPlugin{Log: newTestLogger()}
+		plugin.checkKubeVirtInstalled = func() (bool, error) { return true, nil }
+
+		list, err := plugin.shouldListVMsLocked()
+
+		require.NoError(t, err)
+		assert.True(t, list)
+		assert.Equal(t, kubevirtInstallPresent, plugin.kubevirtInstall)
+	})
+
+	t.Run("discovery error", func(t *testing.T) {
+		plugin := &BackupPlugin{Log: newTestLogger()}
+		plugin.checkKubeVirtInstalled = func() (bool, error) { return false, fmt.Errorf("boom") }
+
+		_, err := plugin.shouldListVMsLocked()
+
+		require.Error(t, err)
+		assert.Equal(t, kubevirtInstallUnknown, plugin.kubevirtInstall)
+	})
+
+	t.Run("cached missing skips rediscovery", func(t *testing.T) {
+		checks := 0
+		plugin := &BackupPlugin{
+			Log:             newTestLogger(),
+			kubevirtInstall: kubevirtInstallMissing,
+			checkKubeVirtInstalled: func() (bool, error) {
+				checks++
+				return true, nil
+			},
+		}
+
+		list, err := plugin.shouldListVMsLocked()
+
+		require.NoError(t, err)
+		assert.False(t, list)
+		assert.Equal(t, 0, checks)
+	})
 }
 
 func TestBackupPlugin_Execute_PVCWithCbtVm(t *testing.T) {
@@ -165,8 +334,7 @@ volumePolicies:
 
 	fakeCoreClientset := k8sfake.NewSimpleClientset(pvc, pv, volumePolicyCM)
 	clients.SetCoreClient(fakeCoreClientset.CoreV1())
-	plugin, err := NewBackupPlugin(newTestLogger(), &fakeCrClient)
-	require.NoError(t, err)
+	plugin := newTestPlugin(t, fakeCrClient)
 	defer clients.SetCoreClient(nil)
 
 	// Setup for plugin execution
@@ -311,4 +479,19 @@ func getFakeClient() crclient.Client {
 		WithScheme(scheme)
 	fakeClient := builder.Build()
 	return fakeClient
+}
+
+// interceptListClient wraps a client and optionally forces List() to fail.
+type interceptListClient struct {
+	crclient.Client
+	listErr   error
+	listCalls int
+}
+
+func (c *interceptListClient) List(ctx context.Context, list crclient.ObjectList, opts ...crclient.ListOption) error {
+	c.listCalls++
+	if c.listErr != nil {
+		return c.listErr
+	}
+	return c.Client.List(ctx, list, opts...)
 }
