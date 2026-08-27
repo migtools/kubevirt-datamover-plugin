@@ -283,6 +283,10 @@ func TestRestorePlugin_Execute_Eligible(t *testing.T) {
 			expectedUpdatedItem := item.DeepCopyObject().(runtime.Unstructured)
 			unstructured.RemoveNestedField(expectedUpdatedItem.UnstructuredContent(), "spec", "volumeName")
 			unstructured.RemoveNestedField(expectedUpdatedItem.UnstructuredContent(), "status")
+			expectedOperationID := generateOperationID(testRestoreName, testOrigNamespace, testRestorePVCName)
+			expectedRestorePVLabelValue := controllercommon.SafeLabelValue(expectedOperationID)
+			require.NoError(t, unstructured.SetNestedStringMap(expectedUpdatedItem.UnstructuredContent(),
+				map[string]string{velerov1.DynamicPVRestoreLabel: expectedRestorePVLabelValue}, "spec", "selector", "matchLabels"))
 
 			restore := &velerov1.Restore{
 				ObjectMeta: metav1.ObjectMeta{Name: testRestoreName, Namespace: testVeleroNS, UID: "restore-uid"},
@@ -356,7 +360,7 @@ func TestClearPVCBinding(t *testing.T) {
 	// struct, which would silently drop it.
 	require.NoError(t, unstructured.SetNestedField(item.UnstructuredContent(), "some-value", "spec", "someFutureField"))
 
-	cleaned, err := clearPVCBinding(item)
+	cleaned, err := clearPVCBinding(item, "test-label-value")
 	require.NoError(t, err)
 
 	_, found, err := unstructured.NestedString(cleaned.UnstructuredContent(), "spec", "volumeName")
@@ -387,6 +391,12 @@ func TestClearPVCBinding(t *testing.T) {
 	assert.True(t, found, "unknown fields must be preserved, not silently dropped")
 	assert.Equal(t, "some-value", futureField)
 
+	matchLabels, found, err := unstructured.NestedStringMap(cleaned.UnstructuredContent(), "spec", "selector", "matchLabels")
+	require.NoError(t, err)
+	require.True(t, found, "spec.selector.matchLabels must be set")
+	assert.Equal(t, "test-label-value", matchLabels[velerov1.DynamicPVRestoreLabel],
+		"spec.selector.matchLabels must carry the passed-in restore PV label value")
+
 	name, found, err := unstructured.NestedString(cleaned.UnstructuredContent(), "metadata", "name")
 	require.NoError(t, err)
 	assert.True(t, found)
@@ -397,15 +407,14 @@ func TestClearPVCBinding(t *testing.T) {
 	assert.True(t, found, "clearPVCBinding must not mutate the passed-in item")
 }
 
-// TestClearPVCBinding_LeavesSelectorUntouched documents current behavior:
-// clearPVCBinding does not clear/reset spec.selector. This is believed safe
-// because spec.selector is only meaningful for a PVC statically pre-bound to
-// an existing PV by label match; a kubevirt-datamover-backed PVC is always
-// dynamically provisioned via a StorageClass and so never has spec.selector
-// set to begin with, making a reset moot. If that assumption is ever wrong
-// for some PVC, this test pins today's actual (not just intended) behavior:
-// whatever was in spec.selector survives clearPVCBinding unchanged.
-func TestClearPVCBinding_LeavesSelectorUntouched(t *testing.T) {
+// TestClearPVCBinding_SetsRestorePVSelector verifies clearPVCBinding always
+// sets spec.selector.matchLabels[velerov1.DynamicPVRestoreLabel] to the passed-in value --
+// this is what makes Kubernetes skip dynamic provisioning entirely on the
+// restored PVC, closing the race where a volumeBindingMode: Immediate
+// StorageClass could otherwise bind it to a foreign PV before the datamover
+// controller rebinds its own reconstructed-disk PV onto it. Any pre-existing
+// selector labels must survive alongside the new one.
+func TestClearPVCBinding_SetsRestorePVSelector(t *testing.T) {
 	testCases := []struct {
 		name     string
 		selector *metav1.LabelSelector
@@ -421,18 +430,15 @@ func TestClearPVCBinding_LeavesSelectorUntouched(t *testing.T) {
 			pvc.Spec.Selector = tc.selector
 			item := restorePVCToUnstructured(t, pvc)
 
-			cleaned, err := clearPVCBinding(item)
+			cleaned, err := clearPVCBinding(item, "test-label-value")
 			require.NoError(t, err)
 
-			selectorMap, found, err := unstructured.NestedMap(cleaned.UnstructuredContent(), "spec", "selector")
+			matchLabels, found, err := unstructured.NestedStringMap(cleaned.UnstructuredContent(), "spec", "selector", "matchLabels")
 			require.NoError(t, err)
-			if tc.selector == nil {
-				assert.False(t, found, "clearPVCBinding must not add a selector that wasn't there")
-			} else {
-				require.True(t, found, "clearPVCBinding must not remove an existing selector")
-				matchLabels, ok := selectorMap["matchLabels"].(map[string]interface{})
-				require.True(t, ok)
-				assert.Equal(t, "some-value", matchLabels["pv-label"], "clearPVCBinding must not alter an existing selector's content")
+			require.True(t, found, "clearPVCBinding must always set spec.selector.matchLabels")
+			assert.Equal(t, "test-label-value", matchLabels[velerov1.DynamicPVRestoreLabel])
+			if tc.selector != nil {
+				assert.Equal(t, "some-value", matchLabels["pv-label"], "clearPVCBinding must not remove a pre-existing selector label")
 			}
 		})
 	}
@@ -457,7 +463,7 @@ func TestClearPVCBinding_DeepCopyNotUnstructured(t *testing.T) {
 	item := restorePVCToUnstructured(t, pvc).(*unstructured.Unstructured)
 	badItem := &nonUnstructuredCopyItem{Unstructured: item}
 
-	_, err := clearPVCBinding(badItem)
+	_, err := clearPVCBinding(badItem, "test-label-value")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to copy restore item")
@@ -775,6 +781,12 @@ func TestRestorePlugin_Execute_AlreadyExists_Reuse(t *testing.T) {
 	require.NoError(t, err, "Execute must reuse the existing DataDownload instead of erroring on AlreadyExists")
 	require.NotNil(t, output)
 	assert.Equal(t, existingOperationID, output.OperationID)
+
+	matchLabels, found, err := unstructured.NestedStringMap(output.UpdatedItem.UnstructuredContent(), "spec", "selector", "matchLabels")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, controllercommon.SafeLabelValue(existingOperationID), matchLabels[velerov1.DynamicPVRestoreLabel],
+		"a retried Execute() call for the same (restore, PVC) must stamp the identical restore-PV selector value, not a new one")
 
 	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datadownloads"}
 	list, err := fakeDynamic.Resource(gvr).Namespace(testVeleroNS).List(context.Background(), metav1.ListOptions{})
@@ -1108,6 +1120,7 @@ func TestRestorePlugin_Execute_SameNamedPVCDifferentNamespaces(t *testing.T) {
 	// they're unrelated Kubernetes objects.
 	const sharedPVCName = "shared-pvc-name"
 	operationIDs := make([]string, 0, 2)
+	restorePVLabelValues := make([]string, 0, 2)
 	for _, ns := range []string{"ns-a", "ns-b"} {
 		pvc := newRestorePVC(ns, sharedPVCName, map[string]string{
 			controllercommon.AnnotationVMName: "my-vm",
@@ -1120,6 +1133,11 @@ func TestRestorePlugin_Execute_SameNamedPVCDifferentNamespaces(t *testing.T) {
 		})
 		require.NoError(t, err, "same-named PVCs from different source namespaces within one restore must not collide")
 		operationIDs = append(operationIDs, output.OperationID)
+
+		matchLabels, found, err := unstructured.NestedStringMap(output.UpdatedItem.UnstructuredContent(), "spec", "selector", "matchLabels")
+		require.NoError(t, err)
+		require.True(t, found, "Execute must stamp spec.selector.matchLabels on the returned item")
+		restorePVLabelValues = append(restorePVLabelValues, matchLabels[velerov1.DynamicPVRestoreLabel])
 	}
 
 	gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datadownloads"}
@@ -1127,6 +1145,9 @@ func TestRestorePlugin_Execute_SameNamedPVCDifferentNamespaces(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, list.Items, 2, "each source namespace's PVC must get its own DataDownload, not a collided/reused one")
 	assert.NotEqual(t, operationIDs[0], operationIDs[1], "same-named PVCs from different source namespaces must get distinct operation IDs")
+	assert.NotEqual(t, restorePVLabelValues[0], restorePVLabelValues[1],
+		"same-named PVCs from different source namespaces must get distinct restore-PV selector label values -- "+
+			"otherwise the datamover controller could match either PVC's selector to the wrong rebound PV")
 }
 
 func TestRestorePlugin_Progress(t *testing.T) {
