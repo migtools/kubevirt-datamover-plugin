@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"sync"
 
-
 	controllercommon "github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	"github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/clients"
 	vmplugin "github.com/migtools/kubevirt-datamover-plugin/kubevirt-datamover-plugin/vm"
@@ -27,23 +26,33 @@ import (
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
 
-	kvcore "kubevirt.io/api/core/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/discovery"
+	kvcore "kubevirt.io/api/core/v1"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+type kubevirtInstallState uint8
+
+const (
+	kubevirtInstallUnknown kubevirtInstallState = iota
+	kubevirtInstallMissing
+	kubevirtInstallPresent
 )
 
 // BackupPlugin is a BackupItemAction plugin for PersistentVolumeClaim resources.
 type BackupPlugin struct {
 	Log logrus.FieldLogger
 	// map[namespace]->[map[vmVolumes]->[]vmName]
-	nsPVCs map[string]map[string][]string
-	lock  sync.Mutex
-	pluginPVCPodCache vmplugin.PluginPVCPodCache
-	crClient crclient.Client
+	nsPVCs                 map[string]map[string][]string
+	lock                   sync.Mutex
+	pluginPVCPodCache      vmplugin.PluginPVCPodCache
+	crClient               crclient.Client
+	kubevirtInstall        kubevirtInstallState
+	checkKubeVirtInstalled func() (bool, error) // tests only
 }
-
 
 // NewBackupPlugin creates a new BackupPlugin instance.
 func NewBackupPlugin(log logrus.FieldLogger, client *crclient.Client) (*BackupPlugin, error) {
@@ -97,13 +106,16 @@ func (p *BackupPlugin) Execute(
 	if err != nil {
 		return item, nil, "", nil, fmt.Errorf("failed to get PVC list: %w", err)
 	}
+	vmNames := pvcs[pvc.Name]
+	if len(vmNames) == 0 {
+		return item, nil, "", nil, nil
+	}
+
 	kubevirtDMVM := ""
-	// Get or create the cached VolumeHelper for this backup
 	vh, err := p.pluginPVCPodCache.GetOrCreateVolumeHelper(backup, p.crClient, p.Log)
 	if err != nil {
 		return item, nil, "", nil, err
 	}
-	vmNames := pvcs[pvc.Name]
 	for _, vmName := range vmNames {
 		vm := new(kvcore.VirtualMachine)
 		err := p.crClient.Get(context.Background(), crclient.ObjectKey{Name: vmName, Namespace: pvc.Namespace}, vm)
@@ -137,13 +149,22 @@ func (p *BackupPlugin) Execute(
 	if err != nil {
 		return nil, nil, "", nil, fmt.Errorf("failed to convert PVC to unstructured: %w", err)
 	}
-	
+
 	return &unstructured.Unstructured{Object: pvcMap}, nil, "", nil, nil
 }
 
 func (p *BackupPlugin) getPVCList(crClient crclient.Client, ns string) (map[string][]string, error) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
+
+	listVMs, err := p.shouldListVMsLocked()
+	if err != nil {
+		return nil, err
+	}
+	if !listVMs {
+		return map[string][]string{}, nil
+	}
+
 	if p.nsPVCs == nil {
 		p.nsPVCs = make(map[string]map[string][]string)
 	}
@@ -151,10 +172,10 @@ func (p *BackupPlugin) getPVCList(crClient crclient.Client, ns string) (map[stri
 	if ok {
 		return pvcList, nil
 	}
+
 	pvcList = make(map[string][]string)
 	vms := new(kvcore.VirtualMachineList)
-	err := crClient.List(context.Background(), vms, crclient.InNamespace(ns))
-	if err != nil {
+	if err := crClient.List(context.Background(), vms, crclient.InNamespace(ns)); err != nil {
 		return nil, fmt.Errorf("failed to list VMs: %w", err)
 	}
 	for i := range vms.Items {
@@ -165,6 +186,61 @@ func (p *BackupPlugin) getPVCList(crClient crclient.Client, ns string) (map[stri
 	}
 	p.nsPVCs[ns] = pvcList
 	return pvcList, nil
+}
+
+// shouldListVMsLocked runs the once-per-backup discovery check.
+// Must be called with p.lock held.
+func (p *BackupPlugin) shouldListVMsLocked() (bool, error) {
+	switch p.kubevirtInstall {
+	case kubevirtInstallMissing:
+		return false, nil
+	case kubevirtInstallPresent:
+		return true, nil
+	default:
+		installed, err := p.kubevirtInstalled()
+		if err != nil {
+			return false, fmt.Errorf("failed to detect kubevirt API: %w", err)
+		}
+		if !installed {
+			p.kubevirtInstall = kubevirtInstallMissing
+			p.Log.Warnf("[pvc-backup] kubevirt.io API group not found in cluster discovery; skipping VM ownership lookup for PVCs in this backup (kubevirt-datamover PVC annotations will not be applied)")
+			return false, nil
+		}
+		p.kubevirtInstall = kubevirtInstallPresent
+		return true, nil
+	}
+}
+
+func (p *BackupPlugin) kubevirtInstalled() (bool, error) {
+	if p.checkKubeVirtInstalled != nil {
+		return p.checkKubeVirtInstalled()
+	}
+	dc, err := newDiscoveryClient()
+	if err != nil {
+		return false, err
+	}
+	return kubevirtGroupInstalled(dc)
+}
+
+var newDiscoveryClient = func() (discovery.ServerGroupsInterface, error) {
+	cfg, err := clients.GetInClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+	return discovery.NewDiscoveryClientForConfig(cfg)
+}
+
+func kubevirtGroupInstalled(dc discovery.ServerGroupsInterface) (bool, error) {
+	groups, err := dc.ServerGroups()
+	if err != nil {
+		return false, err
+	}
+	for i := range groups.Groups {
+		if groups.Groups[i].Name == kvcore.GroupVersion.Group {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // Progress is not implemented for this plugin.
