@@ -316,8 +316,8 @@ github.com/mattn/go-isatty v0.0.12/go.mod h1:cbi8OIDigv2wuxKPP5vlRcQ1OAZbq2CE4Ky
 github.com/mattn/go-isatty v0.0.14/go.mod h1:7GGIvUiUoEMVVmxf/4nioHXj79iQHKdU27kJ6hsGG94=
 github.com/mattn/go-isatty v0.0.21 h1:xYae+lCNBP7QuW4PUnNG61ffM4hVIfm+zUzDuSzYLGs=
 github.com/mattn/go-isatty v0.0.21/go.mod h1:ZXfXG4SQHsB/w3ZeOYbR0PrPwLy+n6xiMrJlRFqopa4=
-github.com/migtools/kubevirt-datamover-controller v0.0.0-20260729163752-37185892c605 h1:6+jbDzfKRShcU1cp7TVrw8ZY/Ub9cAa7n5Geh6q55rk=
-github.com/migtools/kubevirt-datamover-controller v0.0.0-20260729163752-37185892c605/go.mod h1:zOlAYRuAi5zbxJEfB/RPJaS//T3UdxPi86o6uWJwDds=
+github.com/migtools/kubevirt-datamover-controller v0.0.0-20260825051919-e9fa72d416dd h1:bUZYDRrb0NShPhFtNPIodCe7GFyzNfLfM9NQaSNYNgQ=
+github.com/migtools/kubevirt-datamover-controller v0.0.0-20260825051919-e9fa72d416dd/go.mod h1:iSmvYsXVwyOvelmwFM7kr9WZzlbycW6IbG57pJdioqo=
 github.com/mitchellh/mapstructure v1.1.2/go.mod h1:FVVH3fgwuzCH5S8UJGiWEs2h04kUh9fWfEaFds41c1Y=
 github.com/moby/spdystream v0.2.0/go.mod h1:f7i0iNDQJ059oMTcWxx8MA/zKFIuD/lY+0GqbN2Wy8c=
 github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
