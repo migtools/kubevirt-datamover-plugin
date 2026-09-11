@@ -564,7 +564,7 @@ func (p *BackupPlugin) createDataUpload(vm *kvcore.VirtualMachine, backup *veler
 			Labels: map[string]string{
 				velerov1.BackupNameLabel: controllercommon.SafeLabelValue(backup.Name),
 			},
-			Annotations: buildDataUploadAnnotations(vm, operationID),
+			Annotations: buildDataUploadAnnotations(vm, backup, operationID),
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: "velero.io/v1",
@@ -894,7 +894,7 @@ func (p *BackupPlugin) patchDataUploadCancel(namespace, name string, cancel bool
 // buildDataUploadAnnotations constructs the annotation map for a DataUpload CR.
 // It includes required controller annotations and propagates optional per-VM
 // annotations (like backup-pvc-size) from the VM to the DataUpload.
-func buildDataUploadAnnotations(vm *kvcore.VirtualMachine, operationID string) map[string]string {
+func buildDataUploadAnnotations(vm *kvcore.VirtualMachine, backup *velerov1.Backup, operationID string) map[string]string {
 	annotations := map[string]string{
 		controllercommon.AnnotationVMName:      vm.Name,
 		controllercommon.AnnotationVMNamespace: vm.Namespace,
@@ -907,6 +907,32 @@ func buildDataUploadAnnotations(vm *kvcore.VirtualMachine, operationID string) m
 		if size := vm.Annotations[controllercommon.AnnotationBackupPVCSize]; size != "" {
 			annotations[controllercommon.AnnotationBackupPVCSize] = size
 		}
+	}
+
+	// Handle SkipQuiesce annotation
+	effectiveSkipVal := ""
+
+	// Check VM annotation first
+	if vm.Annotations != nil {
+		if val, ok := vm.Annotations[controllercommon.AnnotationSkipQuiesce]; ok {
+			if val == "true" || val == "false" || val == "auto" {
+				effectiveSkipVal = val
+			}
+		}
+	}
+
+	// Fallback to Backup annotation if VM annotation is absent or invalid
+	if effectiveSkipVal == "" && backup.Annotations != nil {
+		if val, ok := backup.Annotations[controllercommon.AnnotationSkipQuiesce]; ok {
+			if val == "true" || val == "false" || val == "auto" {
+				effectiveSkipVal = val
+			}
+		}
+	}
+
+	// Only set on DataUpload if the effective value is "true" or "false"
+	if effectiveSkipVal == "true" || effectiveSkipVal == "false" {
+		annotations[controllercommon.AnnotationSkipQuiesce] = effectiveSkipVal
 	}
 
 	return annotations
