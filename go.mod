@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/bombsimon/logrusr/v4 v4.1.0
-	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260903012300-4d3903ae4508
+	github.com/migtools/kubevirt-datamover-controller v0.0.0-20260904191729-4f588ce7dc71
 	github.com/sirupsen/logrus v1.9.4
 	github.com/stretchr/testify v1.11.1
 	github.com/vmware-tanzu/velero v1.18.3-rc.1
@@ -170,5 +170,3 @@ replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.
 replace github.com/kcp-dev/kcp/sdk v0.0.0-00010101000000-000000000000 => github.com/kcp-dev/kcp/sdk v0.27.1
 
 exclude github.com/kcp-dev/kcp/sdk v0.0.0-00010101000000-000000000000
-
-replace github.com/migtools/kubevirt-datamover-controller => github.com/migtools/kubevirt-datamover-controller v0.0.0-20260904191729-4f588ce7dc71
