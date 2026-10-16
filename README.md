@@ -115,6 +115,40 @@ spec:
   # ... other configuration
 ```
 
+## Forcing a full backup
+
+To request a full backup for the VMs selected for KubeVirt datamover backup, add
+`kubevirt-datamover.io/force-full-backup: "true"` to the Velero Backup:
+
+```yaml
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: vm-full-backup
+  namespace: openshift-adp
+  annotations:
+    kubevirt-datamover.io/force-full-backup: "true"
+spec:
+  includedNamespaces:
+    - vm-namespace
+  snapshotMoveData: true
+```
+
+To request full backups by default for a VM, set the same annotation on the
+VirtualMachine. It applies to subsequent backups until removed or set to `"false"`.
+
+A valid Backup annotation takes precedence over the VM annotation for that Backup.
+The accepted values are `"true"` and `"false"`. An absent or invalid Backup value
+falls back to the VM value; if neither is valid, the controller selects the backup
+mode automatically. `"false"` disables only the explicit full-backup request.
+Checkpoint validation and the configured incremental-backup limit can still
+require a full backup.
+
+The plugin copies the effective value when it creates the DataUpload. Changing
+the annotation afterward does not change an existing DataUpload or VMB. A
+Backup-level request applies only to that Backup and does not change the VM's
+default for future backups.
+
 ## Building
 
 ```bash

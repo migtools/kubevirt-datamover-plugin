@@ -836,6 +836,98 @@ func TestBackupPlugin_CreateDataUpload_Create(t *testing.T) {
 	assert.Equal(t, result, createdDU, "createDataUpload must return the object it actually created")
 }
 
+func TestBackupPlugin_CreateDataUpload_ForceFullBackup(t *testing.T) {
+	tests := []struct {
+		name        string
+		vmValue     string
+		backupValue string
+		want        string
+	}{
+		{name: "absent on both"},
+		{name: "VM requests full", vmValue: "true", want: "true"},
+		{name: "VM disables override", vmValue: "false", want: "false"},
+		{name: "Backup requests full", backupValue: "true", want: "true"},
+		{name: "Backup disables override", backupValue: "false", want: "false"},
+		{name: "both request full", vmValue: "true", backupValue: "true", want: "true"},
+		{name: "Backup false overrides VM true", vmValue: "true", backupValue: "false", want: "false"},
+		{name: "Backup true overrides VM false", vmValue: "false", backupValue: "true", want: "true"},
+		{name: "invalid Backup falls back to VM", vmValue: "true", backupValue: "invalid", want: "true"},
+		{name: "invalid VM does not hide Backup", vmValue: "invalid", backupValue: "true", want: "true"},
+		{name: "invalid VM is ignored", vmValue: "invalid"},
+		{name: "invalid Backup is ignored", backupValue: "invalid"},
+		{name: "both invalid are ignored", vmValue: "invalid-vm", backupValue: "invalid-backup"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{
+				Name: testVMName, Namespace: testNamespace,
+				Annotations: map[string]string{
+					controllercommon.AnnotationBackupPVCSize: "50Gi",
+					controllercommon.AnnotationSkipQuiesce:   "true",
+				},
+			}}
+			backup := &velerov1.Backup{
+				ObjectMeta: metav1.ObjectMeta{Name: testBackupName, Namespace: "velero", UID: "backup-uid"},
+				Spec:       velerov1.BackupSpec{StorageLocation: "my-bsl"},
+			}
+			if tt.vmValue != "" {
+				vm.Annotations[controllercommon.AnnotationForceFullBackup] = tt.vmValue
+			}
+			if tt.backupValue != "" {
+				backup.Annotations = map[string]string{controllercommon.AnnotationForceFullBackup: tt.backupValue}
+			}
+			originalVM := vm.DeepCopy()
+			originalBackup := backup.DeepCopy()
+			sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
+			fakeDynamic := newDataUploadDynamicClient(t)
+			withFakeDynamicClient(t, fakeDynamic)
+			plugin := &BackupPlugin{Log: newTestLogger()}
+
+			result, err := plugin.createDataUpload(vm, backup, "op-force-full", sourcePVC)
+			require.NoError(t, err)
+			gvr := schema.GroupVersionResource{Group: "velero.io", Version: "v2alpha1", Resource: "datauploads"}
+			created, err := fakeDynamic.Resource(gvr).Namespace(backup.Namespace).Get(context.Background(), result.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			annotations := created.GetAnnotations()
+			if tt.want == "" {
+				assert.NotContains(t, annotations, controllercommon.AnnotationForceFullBackup)
+			} else {
+				assert.Equal(t, tt.want, annotations[controllercommon.AnnotationForceFullBackup])
+			}
+			assert.Equal(t, "50Gi", annotations[controllercommon.AnnotationBackupPVCSize])
+			assert.Equal(t, "true", annotations[controllercommon.AnnotationSkipQuiesce])
+			assert.Equal(t, originalVM, vm, "creating a DataUpload must not change the VM annotations")
+			assert.Equal(t, originalBackup, backup, "creating a DataUpload must not change the Backup annotations")
+		})
+	}
+}
+
+func TestBackupPlugin_CreateDataUpload_ForceFullBackupScopedToBackup(t *testing.T) {
+	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: testBackupName, Namespace: "velero", UID: "backup-uid",
+			Annotations: map[string]string{controllercommon.AnnotationForceFullBackup: "true"},
+		},
+		Spec: velerov1.BackupSpec{StorageLocation: "my-bsl"},
+	}
+	sourcePVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "test-pvc", Namespace: testNamespace}}
+	withFakeDynamicClient(t, newDataUploadDynamicClient(t))
+	plugin := &BackupPlugin{Log: newTestLogger()}
+
+	forced, err := plugin.createDataUpload(vm, backup, "op-forced", sourcePVC)
+	require.NoError(t, err)
+	assert.Equal(t, "true", forced.Annotations[controllercommon.AnnotationForceFullBackup])
+
+	nextBackup := backup.DeepCopy()
+	nextBackup.Name = "next-backup"
+	nextBackup.UID = "next-backup-uid"
+	nextBackup.Annotations = nil
+	next, err := plugin.createDataUpload(vm, nextBackup, "op-next", sourcePVC)
+	require.NoError(t, err)
+	assert.NotContains(t, next.Annotations, controllercommon.AnnotationForceFullBackup)
+}
+
 func TestBackupPlugin_CreateDataUpload_CapsExcessiveOperationTimeout(t *testing.T) {
 	vm := &kvcore.VirtualMachine{ObjectMeta: metav1.ObjectMeta{Name: testVMName, Namespace: testNamespace}}
 	backup := &velerov1.Backup{

@@ -892,8 +892,8 @@ func (p *BackupPlugin) patchDataUploadCancel(namespace, name string, cancel bool
 }
 
 // buildDataUploadAnnotations constructs the annotation map for a DataUpload CR.
-// It includes required controller annotations and propagates optional per-VM
-// annotations (like backup-pvc-size) from the VM to the DataUpload.
+// It includes required controller annotations and propagates supported overrides
+// from the VM and Backup to the DataUpload.
 func buildDataUploadAnnotations(vm *kvcore.VirtualMachine, backup *velerov1.Backup, operationID string) map[string]string {
 	annotations := map[string]string{
 		controllercommon.AnnotationVMName:      vm.Name,
@@ -906,6 +906,16 @@ func buildDataUploadAnnotations(vm *kvcore.VirtualMachine, backup *velerov1.Back
 	if vm.Annotations != nil {
 		if size := vm.Annotations[controllercommon.AnnotationBackupPVCSize]; size != "" {
 			annotations[controllercommon.AnnotationBackupPVCSize] = size
+		}
+	}
+
+	// A Backup override takes precedence over the VM's default. False disables
+	// only this explicit request; the controller can still force a full backup
+	// when checkpoint validation or the incremental limit requires it.
+	for _, source := range []map[string]string{backup.Annotations, vm.Annotations} {
+		if value := source[controllercommon.AnnotationForceFullBackup]; value == "true" || value == "false" {
+			annotations[controllercommon.AnnotationForceFullBackup] = value
+			break
 		}
 	}
 
